@@ -1,0 +1,3 @@
+com/firstclub/membership/service/SubscriptionStateMachineTest.class
+com/firstclub/membership/web/MembershipApiIntegrationTest.class
+com/firstclub/membership/strategy/TierEvaluatorTest.class
