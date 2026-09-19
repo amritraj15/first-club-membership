@@ -6,6 +6,8 @@ package com.firstclub.membership.domain;
 public enum BenefitType {
     FREE_DELIVERY,
     PERCENTAGE_DISCOUNT,
+    /** A category-scoped member-only price reduction, distinct from the general discount. */
+    EXCLUSIVE_DEAL,
     EARLY_ACCESS,
     PRIORITY_SUPPORT
 }

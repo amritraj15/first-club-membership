@@ -1,15 +1,16 @@
 # FirstClub Membership Program
 
 A tiered membership backend: Plans (Monthly/Quarterly/Yearly) + Tiers (Silver/Gold/Platinum),
-configurable benefits, order-driven automatic tier promotion, and a checkout-integration
-endpoint. Spring Boot 3 / Java 17, H2 in-memory database, no external services required.
+configurable benefits, order-driven plus scheduled tier reconciliation, exclusive deals, and a
+checkout-integration endpoint. Spring Boot 3 / Java 17, H2 in-memory database, no external
+services required.
 
 ## Verification status
 
-Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn clean test` suite passes:
+Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn test` suite passes:
 
 ```text
-Tests run: 18, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 23, Failures: 0, Errors: 0, Skipped: 0
 ```
 
 This includes fast unit tests and Spring Boot integration tests that start an embedded Tomcat
@@ -25,8 +26,8 @@ mvn clean install
 mvn spring-boot:run
 ```
 
-The app starts on `http://localhost:8080`, seeds demo data on boot (3 plans, 3 tiers with
-benefits/criteria, 2 users), and exposes an H2 console at `/h2-console`
+The app starts on `http://localhost:8080`, seeds 3 plans, 3 tiers, 2 basic users, and 5 named
+active-membership scenarios, and exposes an H2 console at `/h2-console`
 (JDBC URL `jdbc:h2:mem:membershipdb`, user `sa`, empty password) if you want to inspect the
 schema directly.
 
@@ -37,8 +38,8 @@ mvn test
 ```
 
 This runs both kinds of test in the suite:
-- **Unit tests** (`strategy/TierEvaluatorTest`, `service/SubscriptionStateMachineTest`) - plain
-  JUnit 5, no Spring context, fast.
+- **Unit tests** (`strategy/TierEvaluatorTest`, `service/SubscriptionStateMachineTest`,
+  `service/QualificationWindowResolverTest`) - plain JUnit 5, no Spring context, fast.
 - **Integration tests** (`web/MembershipApiIntegrationTest`) - `@SpringBootTest` with a real
   embedded server and `TestRestTemplate`, exercising the actual REST API end-to-end, including a
   genuine concurrent-request test for the duplicate-subscription fix. These start a real Spring
@@ -61,9 +62,10 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   a new one means one new class, zero changes to existing code - see
   `TierEvaluatorTest.cancelledOrdersMustBeExcludedByCallerBeforeEvaluation` and neighbours for
   proof this is independently testable.
-- **Benefits are data, not a class hierarchy** (`TierBenefit` rows: type + param + scope). The
-  spec's own word is "configurable" - read as "changeable without a redeploy," which points at
-  data, not polymorphism.
+- **Benefits are data, not a class hierarchy** (`TierBenefit` rows: type + value + scope). The
+  protected, limited runtime API can add or update only these rows and evicts the tier caches.
+  It supports normal percentage discounts, category-scoped `EXCLUSIVE_DEAL`s, and entitlements
+  such as `EARLY_ACCESS = 7 DAYS`; new tiers/criteria remain controlled policy changes.
 - **Subscription lifecycle is an enum + an allowed-transitions map** (`SubscriptionStateMachine`),
   not a full GoF State pattern. For 3 states with simple rules, the map is exactly as correct and
   far more readable in a 20-minute code review.
@@ -91,11 +93,19 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   (category-specific wins if present, otherwise the ALL-scope rate) - not the sum of both. See
   that class's Javadoc for the alternatives considered (stacking, highest-wins) and why this one
   was chosen.
+- **Qualification windows are criterion-level data.** Calendar month is the default, resolved in
+  the configured `membership.qualification.zone-id` (`Asia/Kolkata` by default); individual
+  criteria can opt into rolling days. The Platinum order-value criterion demonstrates the latter.
+  One evaluation uses a single clock instant and caches order lists by resolved window, so common
+  count/value rules sharing a window result in one order query rather than one per criterion.
 - **Tier evaluation runs synchronously but in its own transaction** (`REQUIRES_NEW`), triggered
-  by order placement/cancellation - not via an event bus. A bug in evaluation can never roll back
-  or block the order write; a failure there is logged and deferred to the next trigger rather
-  than propagated. No message broker, no async infrastructure - deliberately, see "what we did
-  not build" below.
+  immediately by order placement/cancellation and periodically by `TierReconciliationScheduler`
+  (hourly by default). A bug in evaluation can never roll back or block the order write; failures
+  are logged and deferred to the next trigger. No message broker or outbox is required for this
+  assignment.
+- **Time is supplied by one injected `Clock`**, including order placement, lifecycle/expiry
+  checks, response timestamps, seed data, and qualification. This makes time-dependent behaviour
+  deterministic in unit tests and keeps a single business-time source in production.
 - **Expiry is computed lazily on read** (`Subscription.isCurrentlyActive`), not solely by a
   background job - a missed cron run can never make an expired subscription look active, and
   `GET /users/{id}/membership` self-corrects the persisted status on read.
@@ -109,39 +119,32 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
    failure mode than asking the caller to cancel first.
 3. **"More than X orders"** - read as strictly greater-than, not greater-or-equal, per the
    spec's literal wording. Covered by `TierEvaluatorTest.orderCountStrictlyGreaterThanThresholdPromotes`.
-4. **Refunded/cancelled orders** - excluded from the rolling count/value window
-   (`OrderRecordRepository.findByUserIdAndCancelledFalseAndPlacedAtAfter`), so a refund correctly
-   un-counts itself.
+4. **Refunded/cancelled orders** - excluded from every count/value window by the repository
+   query, so a refund correctly un-counts itself.
 5. **AND vs OR across a tier's criteria** - made configurable per tier
    (`Tier.criteriaMatchMode`) rather than hardcoded, since the spec's phrasing ("based on
    criteria like X, Y, or Z") reads as OR but a future tier might legitimately want AND.
-6. **"Total order value in a month"** - implemented as a rolling 30-day window, not a calendar
-   month. Both are defensible readings; rolling avoids a behavioural cliff at the 1st of the
-   month and a timezone dependency the spec doesn't specify. See the constant-level Javadoc on
-   `TierReevaluationTransaction.EVALUATION_WINDOW_DAYS` for the full tradeoff and exactly what
-   would need to change to switch to calendar-month semantics.
+6. **"Total order value in a month"** - calendar month is the default and is now explicit:
+   `[first day 00:00, first day next month 00:00)` in `Asia/Kolkata` by default. A criterion can
+   instead set `ROLLING_DAYS` with its own duration; Platinum's 15,000 order-value rule uses
+   rolling 30 days. `QualificationWindowResolverTest` fixes both interpretations in tests.
 7. **Can a tier demote automatically, or only promote?** Both promotion and automatic demotion
    are allowed - the evaluator always recomputes the highest CURRENTLY-qualifying tier, so a
    user whose order activity drops off can move back down, not just up. See
    `TierReevaluationTransaction`'s class Javadoc for the full reasoning and the important caveat
-   (demotion only happens when evaluation actually runs - see the new reconciliation endpoint
-   below).
-8. **What does "configurable" mean for benefits/tiers?** Configurable at the DATA level (rows in
-   `tier_benefit` / `tier_criterion`, changeable without a redeploy) via `DataSeeder` in this
-   build - NOT configurable via a runtime admin API. No admin CRUD endpoints
-   (`POST /api/admin/tiers`, etc.) were built; that would be a meaningful scope increase for a
-   take-home evaluated on the core domain model, not the admin surface around it. Stated
-   explicitly here rather than left ambiguous.
+   (a scheduler now handles time passing even when no order arrives; manual reconciliation is
+   still available for immediate operation).
+8. **What does "configurable" mean for benefits/tiers?** Tier-benefit rows can be changed at
+   runtime through a small, API-key-protected admin surface. Tier topology and qualification
+   criteria remain code/seed managed, because changing them is a material policy decision.
 9. **Discount stacking** - see the design summary above and `CategoryOverridesGlobalDiscountPolicy`.
 
 ## What was deliberately NOT implemented (and why)
 
-- **Full event/outbox pipeline for tier reconciliation** - order-triggered evaluation
-  (synchronous, own transaction) plus a manually-triggerable
-  `POST /users/{id}/reconcile-tier` endpoint covers the requirement without building a message
-  broker, an outbox table, and a consumer worker. A production deployment would additionally
-  want a scheduled job calling the same idempotent evaluation logic across all active
-  subscriptions periodically - the manual endpoint is the demoable stand-in for that job.
+- **Full event/outbox pipeline for tier reconciliation** - this build has immediate order
+  triggers, a manual reconciliation endpoint, and an hourly in-process scheduled safety net;
+  it intentionally does not introduce a message broker, durable outbox, or distributed job
+  coordination. A multi-instance production deployment should add one of those mechanisms.
 - **Full GoF State pattern classes** for subscription lifecycle - an enum + transition-guard map
   is equally correct and easier to review.
 - **Distributed/keyed locking infrastructure** - a single `@Version` column with retry-once
@@ -158,12 +161,9 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Full order/catalog subsystem** - `OrderRecord` is a minimal stand-in (just value + timestamp)
   purely as the input signal for tier evaluation, since a real order/catalog system is out of
   scope for this exercise.
-- **Cache eviction on config update** - `PlanService` caches plans/tiers (`@Cacheable`, Spring's
-  built-in in-memory cache, no extra dependency) since they sit on the checkout-latency path and
-  rarely change, but there's no admin endpoint to mutate them in this build, so no eviction path
-  was built either. A real admin-update endpoint would need to evict `"plans"`/`"tiers"`/
-  `"tiersDesc"` on write.
-- **Admin configuration API** (`POST /api/admin/tiers`, etc.) - see ambiguity #8 above.
+- **Broad configuration API** (`POST /api/admin/tiers`, criteria editing, plan pricing, deletion)
+  - intentionally not included. The implemented admin surface is limited to tier benefits and
+  evicts `"tiers"` / `"tiersDesc"` after each write.
 - **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and
   returns these as entitlements (`checkout/benefits` reports whether they apply), but does not
   implement the systems that would actually consume them (a sales service gating early access,
@@ -176,9 +176,10 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   (two ACTIVE subscriptions for one user) even without an idempotency key; a key would mainly
   buy a cleaner error/replay experience for the retrying client, which is a real but lower-value
   improvement than the two Priority-1 fixes above.
-- **Authorization boundaries / admin-vs-user API separation** - this build has no auth layer at
-  all (matching the assignment's backend-functionality focus); every endpoint is open. Noted as
-  a real gap for a production system, not addressed here.
+- **Full authorization boundaries / admin-vs-user API separation** - user-facing endpoints still
+  have no identity layer. The mutating admin-benefit routes are the exception: they are closed by
+  default and require `X-Admin-Api-Key` matching `MEMBERSHIP_ADMIN_API_KEY`. Replace this small
+  guard with the deployment's normal role-based identity system in production.
 - **Observability (metrics/structured audit logs)** - `TierReevaluationTransaction` and the
   mutation transactions log promotions, demotions, and conflicts via SLF4J, but there's no
   metrics emission (`tier_promotion_count`, etc.) or structured audit fields beyond what's in
@@ -192,13 +193,13 @@ disposition of each - what got fixed, what got documented instead of built, and 
 | # | Suggestion | Disposition |
 |---|---|---|
 | 1 | DB-level duplicate-active-subscription protection | **Fixed.** `ActiveMembershipLock` + unique constraint; see design summary and `SubscriptionMutationTransactions`. Covered by a genuine concurrent-request integration test. |
-| 2 | Clarify month vs rolling-30-days semantics | **Documented**, not changed - rolling window kept, tradeoff explained in `TierReevaluationTransaction` and ambiguity #6 above. |
+| 2 | Clarify month vs rolling-30-days semantics | **Fixed.** Calendar month is the default and rolling days is an explicit per-criterion opt-in. |
 | 3 | Discount stacking/precedence policy | **Fixed.** `DiscountPolicy` / `CategoryOverridesGlobalDiscountPolicy`; the double-counting bug is now structurally impossible (one rate resolved per cart item). |
 | 4 | REST integration tests | **Added.** `MembershipApiIntegrationTest` - happy paths, 409/422/404 failure cases, and the concurrency test. |
-| 5 | Admin config APIs vs. "configurable" clarification | **Documented, not built** - see ambiguity #8. A real admin CRUD surface is a scope increase this exercise doesn't need. |
+| 5 | Admin config APIs vs. "configurable" clarification | **Implemented narrowly.** Protected runtime CRUD for benefit rows only; no broad tier/criteria CRUD. |
 | 6 | Standardize optimistic-lock retry across mutations | **Fixed.** `cancel` now goes through the same retry-once pattern as `changeTier`, via `SubscriptionService.withOptimisticRetry`. |
 | 7 | Calendar-based duration (`plusMonths`/`plusYears`) | **Fixed.** `Plan.computeEndDate` replaces the fixed 30/90/360-day approximation. |
-| 8 | Durable tier reconciliation (outbox/event pipeline) | **Partially addressed** - a manual `POST /users/{id}/reconcile-tier` endpoint, not a full outbox pipeline. See "deliberately not implemented" above. |
+| 8 | Durable tier reconciliation (outbox/event pipeline) | **Partially addressed.** Immediate order triggers plus the configured scheduled sweep; no durable outbox pipeline. |
 | 9 | Explicitly define demotion policy | **Documented.** Promotion + automatic demotion, both driven by evaluation triggers - see ambiguity #7 and `TierReevaluationTransaction` Javadoc. |
 | 10 | Benefit definition vs. enforcement | **Documented** - see "deliberately not implemented" above; this service defines/exposes entitlements, doesn't enforce them downstream. |
 | 11 | Separate `Subscription` from a `TierQualification` entity | **Not done.** Would help audit/debug at real scale; adds a second entity and a sync concern for a take-home. |
@@ -208,7 +209,7 @@ disposition of each - what got fixed, what got documented instead of built, and 
 | 15 | Richer benefit definition (priority, stackable flag, JSON config blob) | **Not done** - the current `type + paramValue + scope` shape covers everything the spec asks for; a generic config blob would trade compile-time safety for flexibility this exercise doesn't need yet. |
 | 16 | Idempotency keys for subscribe | **Not done** - see "deliberately not implemented" above; the DB constraint already prevents the dangerous outcome. |
 | 17 | HTTP status code mapping (409/422/etc.) | **Fixed** the one real gap: `InvalidTransitionException` now returns 422, not 400. Cancel intentionally still returns 200 + body (not 204) - showing the resulting `CANCELLED` state is more useful for a demo than an empty response, a deliberate choice, not an oversight. |
-| 18 | Authorization boundaries | **Not done** - out of scope for this exercise; noted as a real gap. |
+| 18 | Authorization boundaries | **Partially addressed.** Admin benefit mutation is API-key protected; a full user/admin identity model remains out of scope. |
 | 19 | Pricing/benefit versioning & effective dates | **Not done** - same territory as the pre-existing "price versioning/grandfathering" gap already documented. |
 | 20 | Observability (metrics, structured logs) | **Not done** beyond existing SLF4J logging - noted as a real gap. |
 
@@ -216,20 +217,21 @@ disposition of each - what got fixed, what got documented instead of built, and 
 
 ## API walkthrough (curl)
 
-Assumes the app is running on `localhost:8080` with the seeded demo data (user id `1` = Amrit,
-no cohort; user id `2` = Priya, cohort `VIP`; plan id `1/2/3` = Monthly/Quarterly/Yearly; tier id
-`1/2/3` = Silver/Gold/Platinum - **confirm actual IDs via the `GET` calls below**, since H2
-auto-increment order should match seed order but don't assume it blindly).
+Assumes the app is running on `localhost:8080`. It seeds Amrit (no cohort), Priya (VIP), and
+five active scenarios: `Seed Gold Count`, `Seed Gold Value`, `Seed Platinum VIP`, `Seed Platinum
+Rolling`, and `Seed Calendar Boundary`. Their expected tiers are respectively Gold, Gold,
+Platinum, Platinum, and Silver. Confirm generated IDs via the `GET` calls below rather than
+assuming them.
 
 ```bash
 # 1. List plans and tiers (see actual generated IDs)
 curl -s localhost:8080/api/plans | jq
 curl -s localhost:8080/api/tiers | jq
 
-# 2. Subscribe user 1 to the Monthly plan at Silver tier
-curl -s -X POST localhost:8080/api/subscriptions \
+# 2. Subscribe user 1 to the Monthly plan at Silver tier, retaining the returned subscription id
+SUB_ID=$(curl -s -X POST localhost:8080/api/subscriptions \
   -H "Content-Type: application/json" \
-  -d '{"userId": 1, "planId": 1, "tierId": 1}' | jq
+  -d '{"userId": 1, "planId": 1, "tierId": 1}' | tee /dev/stderr | jq -r .subscriptionId)
 
 # 3. Track current membership
 curl -s localhost:8080/api/users/1/membership | jq
@@ -242,7 +244,7 @@ done
 curl -s localhost:8080/api/users/1/membership | jq   # tierName should now be GOLD, tierSource SYSTEM_PROMOTED
 
 # 5. User manually downgrades back to Silver - system must NOT immediately re-promote
-curl -s -X PATCH localhost:8080/api/subscriptions/1/tier \
+curl -s -X PATCH localhost:8080/api/subscriptions/$SUB_ID/tier \
   -H "Content-Type: application/json" -d '{"newTierId": 1}' | jq
 curl -s localhost:8080/api/users/1/membership | jq   # tierName SILVER, tierSource USER_SELECTED
 
@@ -258,8 +260,8 @@ curl -s -X POST localhost:8080/api/users/1/checkout/benefits \
 # expect totalDiscount = 125.00 (5% of the 2500 cart total), freeDelivery = true
 
 # 8. Illegal transition - cancel twice
-curl -s -X DELETE localhost:8080/api/subscriptions/1 | jq
-curl -s -X DELETE localhost:8080/api/subscriptions/1 -w "\nHTTP %{http_code}\n"   # expect 422
+curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID | jq
+curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID -w "\nHTTP %{http_code}\n"   # expect 422
 
 # 8b. Cancelling frees the "slot" - re-subscribing for the same user now succeeds
 curl -s -X POST localhost:8080/api/subscriptions \
@@ -281,6 +283,14 @@ curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
 # 11. Manual reconciliation - re-run tier evaluation on demand without a new order
 curl -s -X POST localhost:8080/api/users/2/reconcile-tier | jq
 
+# 11b. Platinum exclusive deal + entitlement. Beauty gets its exclusive 20%, not the global 10%;
+#      EARLY_ACCESS reports configuredValue 7 and scope DAYS.
+curl -s localhost:8080/api/users/2/exclusive-deals | jq
+curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
+  -H "Content-Type: application/json" \
+  -d '{"items": [{"category": "Beauty", "price": 1000}]}' | jq
+# expect totalDiscount = 200.00
+
 # 12. Concurrent duplicate-subscribe protection (bug #1 from the review) - fire two subscribe
 #     requests for the SAME new user at once; exactly one should return 201, the other 409.
 curl -s -X POST localhost:8080/api/users \
@@ -296,9 +306,32 @@ wait
 # MembershipApiIntegrationTest.concurrentSubscribeAttempts_onlyOneSucceeds.
 ```
 
+### Runtime benefit administration
+
+These routes are closed by default. A shared Spring MVC interceptor protects every
+`/api/admin/**` route, so newly added admin endpoints inherit the boundary automatically. Start
+the app with a non-empty key, then supply the same key as `X-Admin-Api-Key`. This guard is
+deliberately minimal; use your normal identity provider and administrator role in production.
+
+```bash
+MEMBERSHIP_ADMIN_API_KEY='replace-with-a-secret' mvn spring-boot:run
+
+# List a tier's perk rows, then add a new category deal.
+curl -s localhost:8080/api/admin/tiers/3/benefits \
+  -H "X-Admin-Api-Key: replace-with-a-secret" | jq
+curl -s -X POST localhost:8080/api/admin/tiers/3/benefits \
+  -H "X-Admin-Api-Key: replace-with-a-secret" -H "Content-Type: application/json" \
+  -d '{"benefitType":"EXCLUSIVE_DEAL","paramValue":25,"scope":"Books"}' | jq
+
+# PATCH /api/admin/benefits/{benefitId} accepts the same request body.
+```
+
 ## Performance notes
 
 - Plan/tier listing and checkout-benefit application are cached / bounded in-memory lookups -
   no DB round trip per benefit at checkout, comfortably sub-10ms for realistic cart sizes.
-- Tier evaluation (the O(orders-in-window) part) runs off the checkout path, only on order
-  placement/cancellation - see `TierReevaluationTransaction`.
+- Tier evaluation (the O(orders-in-window) part) runs off the checkout path, on order
+  placement/cancellation and the configured hourly reconciliation sweep - see
+  `TierReevaluationTransaction` and `TierReconciliationScheduler`. It performs at most one
+  repository query per distinct requested window in an evaluation; if window/cardinality grows
+  materially, aggregate queries or precomputed qualification snapshots are the next step.

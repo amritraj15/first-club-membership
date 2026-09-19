@@ -16,7 +16,8 @@ public class PlanDtos {
     public record BenefitResponse(String benefitType, BigDecimal paramValue, String scope) {
     }
 
-    public record CriterionResponse(String criteriaType, BigDecimal threshold, String cohortName) {
+    public record CriterionResponse(String criteriaType, BigDecimal threshold, String cohortName,
+                                    String windowType, int rollingWindowDays) {
     }
 
     public record TierResponse(

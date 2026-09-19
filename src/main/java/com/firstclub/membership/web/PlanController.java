@@ -53,6 +53,7 @@ public class PlanController {
     }
 
     private CriterionResponse toResponse(TierCriterion c) {
-        return new CriterionResponse(c.getCriteriaType().name(), c.getThreshold(), c.getCohortName());
+        return new CriterionResponse(c.getCriteriaType().name(), c.getThreshold(), c.getCohortName(),
+                c.getWindowType().name(), c.getRollingWindowDays());
     }
 }

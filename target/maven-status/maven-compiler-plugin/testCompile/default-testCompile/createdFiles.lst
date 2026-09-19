@@ -1,3 +1,4 @@
-com/firstclub/membership/service/SubscriptionStateMachineTest.class
 com/firstclub/membership/web/MembershipApiIntegrationTest.class
 com/firstclub/membership/strategy/TierEvaluatorTest.class
+com/firstclub/membership/service/QualificationWindowResolverTest.class
+com/firstclub/membership/service/SubscriptionStateMachineTest.class

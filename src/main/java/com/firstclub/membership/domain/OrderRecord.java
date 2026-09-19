@@ -15,8 +15,8 @@ import java.time.Instant;
 /**
  * A placed order, used purely as the input signal for tier evaluation in this exercise (full
  * order/checkout/catalog is out of scope - see README). {@code cancelled} orders are excluded
- * from rolling order-count / order-value totals, so a refund correctly un-counts itself rather
- * than permanently inflating a user's tier eligibility.
+ * from order-count / order-value qualification windows, so a refund correctly un-counts itself
+ * rather than permanently inflating a user's tier eligibility.
  */
 @Entity
 @Table(name = "order_record")

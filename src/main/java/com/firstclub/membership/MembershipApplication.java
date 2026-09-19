@@ -3,6 +3,7 @@ package com.firstclub.membership;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Entry point for the FirstClub Membership Program service.
@@ -22,6 +23,7 @@ import org.springframework.cache.annotation.EnableCaching;
  */
 @SpringBootApplication
 @EnableCaching
+@EnableScheduling
 public class MembershipApplication {
     public static void main(String[] args) {
         SpringApplication.run(MembershipApplication.class, args);

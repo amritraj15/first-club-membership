@@ -11,7 +11,7 @@ import com.firstclub.membership.repository.UserRepository;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.time.Instant;
+import java.time.Clock;
 
 /**
  * Records order activity and triggers tier re-evaluation. Placing/cancelling an order is the
@@ -31,15 +31,18 @@ public class OrderService {
     private final UserRepository userRepository;
     private final SubscriptionRepository subscriptionRepository;
     private final TierEvaluationService tierEvaluationService;
+    private final Clock clock;
 
     public OrderService(OrderRecordRepository orderRecordRepository,
                          UserRepository userRepository,
                          SubscriptionRepository subscriptionRepository,
-                         TierEvaluationService tierEvaluationService) {
+                         TierEvaluationService tierEvaluationService,
+                         Clock clock) {
         this.orderRecordRepository = orderRecordRepository;
         this.userRepository = userRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.tierEvaluationService = tierEvaluationService;
+        this.clock = clock;
     }
 
     /**
@@ -76,7 +79,7 @@ public class OrderService {
     OrderRecord recordOrderAndClearOverride(Long userId, BigDecimal value) {
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + userId));
-        OrderRecord order = orderRecordRepository.save(new OrderRecord(user, value, Instant.now()));
+        OrderRecord order = orderRecordRepository.save(new OrderRecord(user, value, clock.instant()));
         clearManualOverrideIfPresent(userId);
         return order;
     }

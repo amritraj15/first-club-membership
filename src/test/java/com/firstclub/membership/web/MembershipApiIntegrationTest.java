@@ -3,6 +3,9 @@ package com.firstclub.membership.web;
 import com.firstclub.membership.dto.CheckoutDtos.CartItem;
 import com.firstclub.membership.dto.CheckoutDtos.CheckoutRequest;
 import com.firstclub.membership.dto.CheckoutDtos.CheckoutResponse;
+import com.firstclub.membership.dto.AdminBenefitDtos.TierBenefitAdminResponse;
+import com.firstclub.membership.dto.AdminBenefitDtos.UpsertTierBenefitRequest;
+import com.firstclub.membership.dto.ExclusiveDealDtos.ExclusiveDealResponse;
 import com.firstclub.membership.dto.OrderDtos.OrderPlacedResponse;
 import com.firstclub.membership.dto.OrderDtos.PlaceOrderRequest;
 import com.firstclub.membership.dto.PlanDtos.PlanResponse;
@@ -20,6 +23,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 
 import java.math.BigDecimal;
@@ -45,7 +50,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * fixed seeded IDs, since DataSeeder's auto-increment IDs are an implementation detail, not a
  * contract.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "membership.admin.api-key=integration-test-admin-key")
 class MembershipApiIntegrationTest {
 
     // @LocalServerPort's package has moved between Spring Boot versions (an easy thing to get
@@ -89,6 +95,12 @@ class MembershipApiIntegrationTest {
                 url("/api/users"), new CreateUserRequest(name, email, cohort), UserResponse.class);
         assertEquals(HttpStatus.CREATED, response.getStatusCode());
         return response.getBody().id();
+    }
+
+    private HttpHeaders adminHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Admin-Api-Key", "integration-test-admin-key");
+        return headers;
     }
 
     // ---- Happy path: subscribe, track, cancel ----
@@ -250,6 +262,78 @@ class MembershipApiIntegrationTest {
         assertEquals(0, new BigDecimal("200.00").compareTo(body.totalDiscount()),
                 "category-specific and ALL discounts must not stack");
         assertTrue(body.freeDelivery());
+    }
+
+    // ---- Exclusive deals and non-zero early access ----
+
+    @Test
+    void exclusiveDealOverridesGeneralDiscount_andEarlyAccessShowsItsConfiguredDays() {
+        Long userId = createUser("Deals", "deals+" + System.nanoTime() + "@example.com", "VIP");
+        rest.postForEntity(url("/api/subscriptions"),
+                new SubscribeRequest(userId, monthlyPlanId, platinumTierId), MembershipStatusResponse.class);
+
+        ResponseEntity<ExclusiveDealResponse[]> deals = rest.getForEntity(
+                url("/api/users/" + userId + "/exclusive-deals"), ExclusiveDealResponse[].class);
+        assertEquals(HttpStatus.OK, deals.getStatusCode());
+        assertTrue(List.of(deals.getBody()).stream().anyMatch(deal -> deal.category().equals("Beauty")
+                && deal.discountPercent().compareTo(new BigDecimal("20")) == 0));
+
+        ResponseEntity<CheckoutResponse> response = rest.postForEntity(
+                url("/api/users/" + userId + "/checkout/benefits"),
+                new CheckoutRequest(List.of(new CartItem("Beauty", new BigDecimal("1000")))), CheckoutResponse.class);
+
+        CheckoutResponse body = response.getBody();
+        assertEquals(0, body.totalDiscount().compareTo(new BigDecimal("200.00")));
+        assertTrue(body.appliedBenefits().stream().anyMatch(benefit -> benefit.benefitType().equals("EXCLUSIVE_DEAL")
+                && benefit.configuredValue().compareTo(new BigDecimal("20")) == 0));
+        assertTrue(body.appliedBenefits().stream().anyMatch(benefit -> benefit.benefitType().equals("EARLY_ACCESS")
+                && benefit.scope().equals("DAYS") && benefit.configuredValue().compareTo(new BigDecimal("7")) == 0));
+    }
+
+    // ---- Protected runtime benefit administration ----
+
+    @Test
+    void protectedAdminApiUpdatesBenefitAndCheckoutUsesNewValueImmediately() {
+        ResponseEntity<Map> denied = rest.getForEntity(
+                url("/api/admin/tiers/" + platinumTierId + "/benefits"), Map.class);
+        assertEquals(HttpStatus.FORBIDDEN, denied.getStatusCode());
+
+        UpsertTierBenefitRequest create = new UpsertTierBenefitRequest(
+                com.firstclub.membership.domain.BenefitType.EXCLUSIVE_DEAL, new BigDecimal("25"), "Books");
+        ResponseEntity<TierBenefitAdminResponse> created = rest.exchange(
+                url("/api/admin/tiers/" + platinumTierId + "/benefits"), org.springframework.http.HttpMethod.POST,
+                new HttpEntity<>(create, adminHeaders()), TierBenefitAdminResponse.class);
+        assertEquals(HttpStatus.CREATED, created.getStatusCode());
+        assertTrue(created.getBody().id() != null);
+
+        UpsertTierBenefitRequest update = new UpsertTierBenefitRequest(
+                com.firstclub.membership.domain.BenefitType.EXCLUSIVE_DEAL, new BigDecimal("30"), "Books");
+        ResponseEntity<TierBenefitAdminResponse> changed = rest.exchange(
+                url("/api/admin/benefits/" + created.getBody().id()), org.springframework.http.HttpMethod.PATCH,
+                new HttpEntity<>(update, adminHeaders()), TierBenefitAdminResponse.class);
+        assertEquals(HttpStatus.OK, changed.getStatusCode());
+        assertEquals(0, changed.getBody().paramValue().compareTo(new BigDecimal("30")));
+
+        Long userId = createUser("Admin Deal", "admin-deal+" + System.nanoTime() + "@example.com", "VIP");
+        rest.postForEntity(url("/api/subscriptions"),
+                new SubscribeRequest(userId, monthlyPlanId, platinumTierId), MembershipStatusResponse.class);
+        ResponseEntity<CheckoutResponse> checkout = rest.postForEntity(
+                url("/api/users/" + userId + "/checkout/benefits"),
+                new CheckoutRequest(List.of(new CartItem("Books", new BigDecimal("1000")))), CheckoutResponse.class);
+        assertEquals(0, checkout.getBody().totalDiscount().compareTo(new BigDecimal("300.00")));
+    }
+
+    @Test
+    void tierApiShowsCalendarMonthDefaultAndTheOptInRollingCriterion() {
+        ResponseEntity<TierResponse[]> response = rest.getForEntity(url("/api/tiers"), TierResponse[].class);
+        TierResponse gold = List.of(response.getBody()).stream()
+                .filter(tier -> tier.name().equals("GOLD")).findFirst().orElseThrow();
+        TierResponse platinum = List.of(response.getBody()).stream()
+                .filter(tier -> tier.name().equals("PLATINUM")).findFirst().orElseThrow();
+
+        assertTrue(gold.criteria().stream().allMatch(criterion -> criterion.windowType().equals("CALENDAR_MONTH")));
+        assertTrue(platinum.criteria().stream().anyMatch(criterion -> criterion.windowType().equals("ROLLING_DAYS")
+                && criterion.rollingWindowDays() == 30));
     }
 
     // ---- Illegal transition -> 422, not 400 ----

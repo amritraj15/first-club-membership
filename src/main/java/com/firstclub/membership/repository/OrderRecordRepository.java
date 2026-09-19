@@ -8,5 +8,6 @@ import java.util.List;
 
 public interface OrderRecordRepository extends JpaRepository<OrderRecord, Long> {
 
-    List<OrderRecord> findByUserIdAndCancelledFalseAndPlacedAtAfter(Long userId, Instant since);
+    List<OrderRecord> findByUserIdAndCancelledFalseAndPlacedAtGreaterThanEqualAndPlacedAtLessThan(
+            Long userId, Instant startInclusive, Instant endExclusive);
 }

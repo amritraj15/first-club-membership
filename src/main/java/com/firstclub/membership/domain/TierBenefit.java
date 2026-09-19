@@ -34,8 +34,8 @@ public class TierBenefit {
     @Enumerated(EnumType.STRING)
     private BenefitType benefitType;
 
-    /** Meaning depends on benefitType: percentage for PERCENTAGE_DISCOUNT, unused for
-     *  FREE_DELIVERY / EARLY_ACCESS / PRIORITY_SUPPORT (kept nullable-friendly via 0). */
+    /** Meaning depends on benefitType: percentage for PERCENTAGE_DISCOUNT / EXCLUSIVE_DEAL,
+     *  early-access days for EARLY_ACCESS, unused for FREE_DELIVERY / PRIORITY_SUPPORT. */
     private BigDecimal paramValue = BigDecimal.ZERO;
 
     /** Category/item scope this benefit applies to, or "ALL" for cart-wide. Free-text and
@@ -74,5 +74,12 @@ public class TierBenefit {
 
     public String getScope() {
         return scope;
+    }
+
+    /** Limited mutation point used by the protected benefit-management API. */
+    public void update(BenefitType benefitType, BigDecimal paramValue, String scope) {
+        this.benefitType = benefitType;
+        this.paramValue = paramValue;
+        this.scope = scope;
     }
 }

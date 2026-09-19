@@ -28,3 +28,13 @@ spring:
 logging:
   level:
     com.firstclub.membership: INFO
+
+membership:
+  qualification:
+    zone-id: Asia/Kolkata
+  reconciliation:
+    fixed-delay-ms: 3600000
+    initial-delay-ms: 60000
+  admin:
+    # Closed by default. Supply MEMBERSHIP_ADMIN_API_KEY in the deployment environment to enable.
+    api-key: ${MEMBERSHIP_ADMIN_API_KEY:}

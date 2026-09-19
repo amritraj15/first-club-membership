@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.time.Clock;
 import java.util.List;
 
 /**
@@ -41,17 +42,20 @@ public class SubscriptionMutationTransactions {
     private final PlanService planService;
     private final SubscriptionStateMachine stateMachine;
     private final ActiveMembershipLockRepository lockRepository;
+    private final Clock clock;
 
     public SubscriptionMutationTransactions(SubscriptionRepository subscriptionRepository,
                                              UserRepository userRepository,
                                              PlanService planService,
                                              SubscriptionStateMachine stateMachine,
-                                             ActiveMembershipLockRepository lockRepository) {
+                                             ActiveMembershipLockRepository lockRepository,
+                                             Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.userRepository = userRepository;
         this.planService = planService;
         this.stateMachine = stateMachine;
         this.lockRepository = lockRepository;
+        this.clock = clock;
     }
 
     /**
@@ -89,7 +93,7 @@ public class SubscriptionMutationTransactions {
         Tier tier = planService.getTier(tierId);
 
         List<Subscription> activeStatusSubs = subscriptionRepository.findByUserIdAndStatus(userId, SubscriptionStatus.ACTIVE);
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         for (Subscription existing : activeStatusSubs) {
             if (existing.isCurrentlyActive(now)) {
                 throw new ConflictException(
@@ -147,7 +151,7 @@ public class SubscriptionMutationTransactions {
                 .orElseThrow(() -> new NotFoundException("Subscription not found: " + subscriptionId));
         stateMachine.assertTransitionAllowed(subscription.getStatus(), SubscriptionStatus.CANCELLED);
         subscription.setStatus(SubscriptionStatus.CANCELLED);
-        subscription.setEndDate(Instant.now());
+        subscription.setEndDate(clock.instant());
         subscription = subscriptionRepository.save(subscription);
         lockRepository.deleteByUserId(subscription.getUser().getId());
         return subscription;

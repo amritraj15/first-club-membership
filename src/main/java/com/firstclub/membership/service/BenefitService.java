@@ -7,6 +7,7 @@ import com.firstclub.membership.domain.TierBenefit;
 import com.firstclub.membership.dto.CheckoutDtos.AppliedBenefit;
 import com.firstclub.membership.dto.CheckoutDtos.CartItem;
 import com.firstclub.membership.dto.CheckoutDtos.CheckoutResponse;
+import com.firstclub.membership.dto.ExclusiveDealDtos.ExclusiveDealResponse;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -25,7 +26,8 @@ import java.util.Map;
  * evaluate tier) deliberately never runs on this path; see TierEvaluationService.
  * <p>
  * PERCENTAGE_DISCOUNT is resolved PER CART ITEM via {@link DiscountPolicy}, not by summing a
- * scope-total across the whole cart. An earlier version of this method computed each
+ * scope-total across the whole cart. An exact category {@code EXCLUSIVE_DEAL} has precedence
+ * over that normal rate, and also never stacks. An earlier version of this method computed each
  * PERCENTAGE_DISCOUNT benefit's total independently over its matching items and added them all
  * up - which meant a tier with both "10% off ALL" and "15% off Electronics" applied BOTH to an
  * Electronics item, silently producing a 25% effective discount. Resolving one rate per item
@@ -52,27 +54,36 @@ public class BenefitService {
         List<AppliedBenefit> nonDiscountBenefits = new ArrayList<>();
 
         List<TierBenefit> percentageDiscountBenefits = new ArrayList<>();
+        List<TierBenefit> exclusiveDeals = new ArrayList<>();
         for (TierBenefit benefit : tier.getBenefits()) {
             switch (benefit.getBenefitType()) {
                 case FREE_DELIVERY -> {
                     freeDelivery = true;
-                    nonDiscountBenefits.add(new AppliedBenefit(BenefitType.FREE_DELIVERY.name(), benefit.getScope(), BigDecimal.ZERO));
+                    nonDiscountBenefits.add(new AppliedBenefit(BenefitType.FREE_DELIVERY.name(), benefit.getScope(),
+                            BigDecimal.ZERO, benefit.getParamValue()));
                 }
                 case PRIORITY_SUPPORT -> {
                     prioritySupport = true;
-                    nonDiscountBenefits.add(new AppliedBenefit(BenefitType.PRIORITY_SUPPORT.name(), benefit.getScope(), BigDecimal.ZERO));
+                    nonDiscountBenefits.add(new AppliedBenefit(BenefitType.PRIORITY_SUPPORT.name(), benefit.getScope(),
+                            BigDecimal.ZERO, benefit.getParamValue()));
                 }
                 case EARLY_ACCESS -> nonDiscountBenefits.add(
-                        new AppliedBenefit(BenefitType.EARLY_ACCESS.name(), benefit.getScope(), BigDecimal.ZERO));
+                        new AppliedBenefit(BenefitType.EARLY_ACCESS.name(), benefit.getScope(),
+                                BigDecimal.ZERO, benefit.getParamValue()));
                 case PERCENTAGE_DISCOUNT -> percentageDiscountBenefits.add(benefit);
+                case EXCLUSIVE_DEAL -> exclusiveDeals.add(benefit);
             }
         }
 
-        // One rate per item, resolved through the policy - see class javadoc.
+        // A category-specific exclusive deal wins for that item; otherwise the normal one-rate
+        // discount policy applies. Neither path stacks rates.
         BigDecimal totalDiscount = BigDecimal.ZERO;
-        Map<String, BigDecimal> discountByResolvedScope = new LinkedHashMap<>();
+        Map<String, AppliedDiscount> discountByResolvedScope = new LinkedHashMap<>();
         for (CartItem item : items) {
-            BigDecimal rate = discountPolicy.resolveRate(item.category(), percentageDiscountBenefits);
+            TierBenefit exclusiveDeal = findExclusiveDeal(item.category(), exclusiveDeals);
+            BigDecimal rate = exclusiveDeal == null
+                    ? discountPolicy.resolveRate(item.category(), percentageDiscountBenefits)
+                    : exclusiveDeal.getParamValue();
             if (rate.compareTo(BigDecimal.ZERO) <= 0) {
                 continue;
             }
@@ -80,15 +91,19 @@ public class BenefitService {
                     .multiply(rate)
                     .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
             totalDiscount = totalDiscount.add(itemDiscount);
-            // Group the response by the category the rate actually resolved for (so the caller
-            // can see e.g. "Electronics: 15%" separately from "ALL (fallback): 10%"), not by
-            // every configured benefit regardless of whether it actually applied to anything.
-            String resolvedLabel = matchesCategory(item.category(), percentageDiscountBenefits) ? item.category() : "ALL";
-            discountByResolvedScope.merge(resolvedLabel, itemDiscount, BigDecimal::add);
+            String benefitType = exclusiveDeal == null
+                    ? BenefitType.PERCENTAGE_DISCOUNT.name() : BenefitType.EXCLUSIVE_DEAL.name();
+            String resolvedLabel = exclusiveDeal != null ? exclusiveDeal.getScope()
+                    : matchesCategory(item.category(), percentageDiscountBenefits) ? item.category() : "ALL";
+            String key = benefitType + "|" + resolvedLabel + "|" + rate;
+            discountByResolvedScope.merge(key,
+                    new AppliedDiscount(benefitType, resolvedLabel, itemDiscount, rate),
+                    (left, right) -> new AppliedDiscount(left.benefitType(), left.scope(),
+                            left.discountAmount().add(right.discountAmount()), left.configuredValue()));
         }
 
-        List<AppliedBenefit> appliedDiscounts = discountByResolvedScope.entrySet().stream()
-                .map(e -> new AppliedBenefit(BenefitType.PERCENTAGE_DISCOUNT.name(), e.getKey(), e.getValue()))
+        List<AppliedBenefit> appliedDiscounts = discountByResolvedScope.values().stream()
+                .map(e -> new AppliedBenefit(e.benefitType(), e.scope(), e.discountAmount(), e.configuredValue()))
                 .toList();
 
         List<AppliedBenefit> applied = new ArrayList<>(nonDiscountBenefits);
@@ -98,8 +113,26 @@ public class BenefitService {
         return new CheckoutResponse(cartTotal, totalDiscount, freeDelivery, prioritySupport, finalTotal, applied);
     }
 
+    public List<ExclusiveDealResponse> exclusiveDeals(Subscription subscription) {
+        return subscription.getTier().getBenefits().stream()
+                .filter(benefit -> benefit.getBenefitType() == BenefitType.EXCLUSIVE_DEAL)
+                .map(benefit -> new ExclusiveDealResponse(benefit.getScope(), benefit.getParamValue()))
+                .toList();
+    }
+
+    private TierBenefit findExclusiveDeal(String category, List<TierBenefit> exclusiveDeals) {
+        return exclusiveDeals.stream()
+                .filter(deal -> deal.getScope().equalsIgnoreCase(category))
+                .findFirst()
+                .orElse(null);
+    }
+
     private boolean matchesCategory(String category, List<TierBenefit> percentageDiscountBenefits) {
         return percentageDiscountBenefits.stream()
                 .anyMatch(b -> b.getScope().equalsIgnoreCase(category));
+    }
+
+    private record AppliedDiscount(String benefitType, String scope, BigDecimal discountAmount,
+                                   BigDecimal configuredValue) {
     }
 }

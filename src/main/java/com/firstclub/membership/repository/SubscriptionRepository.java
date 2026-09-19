@@ -3,6 +3,8 @@ package com.firstclub.membership.repository;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.List;
 import java.util.Optional;
@@ -16,4 +18,7 @@ public interface SubscriptionRepository extends JpaRepository<Subscription, Long
     /** No status filter - used for "track current membership", which must be able to show an
      *  already-expired subscription's details rather than 404 once expiry is detected. */
     Optional<Subscription> findFirstByUserIdOrderByStartDateDesc(Long userId);
+
+    @Query("select distinct s.user.id from Subscription s where s.status = :status")
+    List<Long> findDistinctUserIdsByStatus(@Param("status") SubscriptionStatus status);
 }

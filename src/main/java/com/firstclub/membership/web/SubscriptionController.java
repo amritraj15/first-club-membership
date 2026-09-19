@@ -12,6 +12,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Duration;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.Map;
 
@@ -22,11 +23,14 @@ public class SubscriptionController {
 
     private final SubscriptionService subscriptionService;
     private final TierEvaluationService tierEvaluationService;
+    private final Clock clock;
 
     public SubscriptionController(SubscriptionService subscriptionService,
-                                   TierEvaluationService tierEvaluationService) {
+                                   TierEvaluationService tierEvaluationService,
+                                   Clock clock) {
         this.subscriptionService = subscriptionService;
         this.tierEvaluationService = tierEvaluationService;
+        this.clock = clock;
     }
 
     @PostMapping("/subscriptions")
@@ -54,16 +58,8 @@ public class SubscriptionController {
     }
 
     /**
-     * Manual tier reconciliation - the lightweight safety net for the gap that a full
-     * event/outbox pipeline would otherwise close: tier promotion/demotion is normally
-     * triggered by order placement/cancellation only (see OrderService), so a user whose
-     * qualifying activity has fallen (e.g. their order-window activity aged out with no new
-     * order to re-trigger evaluation) can sit on a stale tier indefinitely with nothing to
-     * prompt a recheck. A full outbox-pattern event pipeline was deliberately NOT built for
-     * this exercise (see README "deliberately not implemented") - this endpoint is the
-     * documented, demoable stand-in: it runs the exact same idempotent evaluation logic
-     * on demand, and in production would also be wrapped in a scheduled job hitting every
-     * active subscription periodically.
+     * Runs the same idempotent reconciliation used by the scheduled safety net immediately on
+     * demand. It is useful after an operator changes data or wants a visible demo result.
      */
     @PostMapping("/users/{userId}/reconcile-tier")
     public ResponseEntity<Map<String, Object>> reconcileTier(@PathVariable Long userId) {
@@ -76,7 +72,7 @@ public class SubscriptionController {
     }
 
     private MembershipStatusResponse toResponse(Subscription s) {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         long daysRemaining = Math.max(0, Duration.between(now, s.getEndDate()).toDays());
         return new MembershipStatusResponse(
                 s.getId(),

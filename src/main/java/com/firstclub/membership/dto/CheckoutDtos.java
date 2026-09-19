@@ -24,7 +24,12 @@ public class CheckoutDtos {
     ) {
     }
 
-    public record AppliedBenefit(String benefitType, String scope, BigDecimal discountAmount) {
+    /**
+     * discountAmount is the money taken from this cart; configuredValue is the benefit's
+     * configured percentage or duration (for example, EARLY_ACCESS = 7 DAYS).
+     */
+    public record AppliedBenefit(String benefitType, String scope, BigDecimal discountAmount,
+                                 BigDecimal configuredValue) {
     }
 
     public record CheckoutResponse(

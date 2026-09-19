@@ -1,9 +1,11 @@
 package com.firstclub.membership.service;
 
+import com.firstclub.membership.domain.CriteriaType;
 import com.firstclub.membership.domain.OrderRecord;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
 import com.firstclub.membership.domain.Tier;
+import com.firstclub.membership.domain.TierCriterion;
 import com.firstclub.membership.domain.TierSource;
 import com.firstclub.membership.domain.User;
 import com.firstclub.membership.repository.OrderRecordRepository;
@@ -16,8 +18,10 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.time.Clock;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -40,54 +44,34 @@ import java.util.Optional;
  * no ongoing qualifying behaviour) and contradicts "users move through tiers... based on
  * criteria" reading as a live, not one-way, relationship between behaviour and tier.
  * <p>
- * The caveat: demotion (like promotion) only happens when THIS method actually runs - i.e. on
- * an order placement/cancellation, or a manual call to
- * {@code POST /users/{id}/reconcile-tier} (see SubscriptionController). Pure time passing with
- * no new order and no reconciliation call will not, by itself, trigger a demotion - there is no
- * scheduled background sweep in this build (see README "deliberately not implemented" on the
- * outbox/event-pipeline suggestion). This is called out explicitly rather than left implicit,
- * since it's exactly the kind of gap a production deployment would need to close with a
- * scheduled job calling this same method for every active subscription.
+ * A scheduled reconciliation sweep is also provided for time passing with no new order. It
+ * calls this same idempotent method for each active user; order placement/cancellation remains
+ * the immediate trigger.
  */
 @Service
 public class TierReevaluationTransaction {
 
     private static final Logger log = LoggerFactory.getLogger(TierReevaluationTransaction.class);
 
-    /**
-     * "Total order value in a month" / order-count window - EXPLICITLY a rolling 30-day window
-     * (last 30*24 hours from now), NOT a calendar month (1st-to-30th/31st). This is a
-     * deliberate, documented choice between the two readings the spec's wording allows:
-     * <ul>
-     *   <li>Rolling 30 days (chosen): a user's eligibility is evaluated the same way regardless
-     *       of what day of the month it currently is - no "reset to zero on the 1st" cliff where
-     *       someone with 24 orders on the 28th loses all of them on the 1st. Simpler to reason
-     *       about and implement correctly (no timezone-bound month-boundary arithmetic).</li>
-     *   <li>Calendar month (rejected here, but noted as the more literal reading of "in a
-     *       month"): would need an explicit timezone for "when does the month roll over" (a
-     *       requirement the spec doesn't specify), and creates a real behavioural cliff at
-     *       midnight on the 1st that a rolling window avoids.</li>
-     * </ul>
-     * If the actual intended semantics are calendar-month, this constant plus the query in
-     * {@link com.firstclub.membership.repository.OrderRecordRepository} are the only two things
-     * that need to change - the strategies, evaluator, and everything downstream are
-     * window-agnostic.
-     */
-    private static final int EVALUATION_WINDOW_DAYS = 30;
-
     private final SubscriptionRepository subscriptionRepository;
     private final OrderRecordRepository orderRecordRepository;
     private final PlanService planService;
     private final TierEvaluator tierEvaluator;
+    private final QualificationWindowResolver qualificationWindowResolver;
+    private final Clock clock;
 
     public TierReevaluationTransaction(SubscriptionRepository subscriptionRepository,
                                         OrderRecordRepository orderRecordRepository,
                                         PlanService planService,
-                                        TierEvaluator tierEvaluator) {
+                                        TierEvaluator tierEvaluator,
+                                        QualificationWindowResolver qualificationWindowResolver,
+                                        Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.orderRecordRepository = orderRecordRepository;
         this.planService = planService;
         this.tierEvaluator = tierEvaluator;
+        this.qualificationWindowResolver = qualificationWindowResolver;
+        this.clock = clock;
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -98,17 +82,16 @@ public class TierReevaluationTransaction {
             return false; // No active subscription - nothing to promote/demote.
         }
         Subscription subscription = maybeSub.get();
-        if (!subscription.isCurrentlyActive(Instant.now())) {
+        Instant evaluationTime = clock.instant();
+        if (!subscription.isCurrentlyActive(evaluationTime)) {
             return false; // Lazily-detected expiry - a background job will flip status separately.
         }
 
         User user = subscription.getUser();
-        Instant windowStart = Instant.now().minus(EVALUATION_WINDOW_DAYS, ChronoUnit.DAYS);
-        List<OrderRecord> recentOrders =
-                orderRecordRepository.findByUserIdAndCancelledFalseAndPlacedAtAfter(userId, windowStart);
-
         List<Tier> allTiers = planService.listTiersAscending();
-        Tier qualifyingTier = tierEvaluator.evaluate(user, recentOrders, allTiers);
+        Map<QualificationWindowResolver.QualificationWindow, List<OrderRecord>> ordersByWindow = new HashMap<>();
+        Tier qualifyingTier = tierEvaluator.evaluate(
+                user, criterion -> ordersForCriterion(userId, criterion, evaluationTime, ordersByWindow), allTiers);
 
         if (subscription.isManualTierOverride()) {
             // Respect the user's explicit choice for now; it gets cleared the next time they
@@ -127,5 +110,23 @@ public class TierReevaluationTransaction {
         subscription.setTierSource(TierSource.SYSTEM_PROMOTED);
         subscriptionRepository.save(subscription);
         return true;
+    }
+
+    /**
+     * A tier can have several criteria but often shares a window (for example, order-count and
+     * order-value in the current month). Cache per resolved window for this evaluation so the
+     * repository is queried once per distinct window, while TierEvaluator still short-circuits.
+     */
+    private List<OrderRecord> ordersForCriterion(Long userId, TierCriterion criterion, Instant evaluationTime,
+                                                 Map<QualificationWindowResolver.QualificationWindow,
+                                                         List<OrderRecord>> ordersByWindow) {
+        if (criterion.getCriteriaType() == CriteriaType.COHORT) {
+            return List.of();
+        }
+        QualificationWindowResolver.QualificationWindow window =
+                qualificationWindowResolver.resolve(criterion, evaluationTime);
+        return ordersByWindow.computeIfAbsent(window, resolvedWindow ->
+                orderRecordRepository.findByUserIdAndCancelledFalseAndPlacedAtGreaterThanEqualAndPlacedAtLessThan(
+                        userId, resolvedWindow.startInclusive(), resolvedWindow.endExclusive()));
     }
 }

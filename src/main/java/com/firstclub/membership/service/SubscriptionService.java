@@ -11,7 +11,7 @@ import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
+import java.time.Clock;
 
 /**
  * User-initiated subscription lifecycle: subscribe, upgrade/downgrade tier, cancel, and status
@@ -34,11 +34,13 @@ public class SubscriptionService {
 
     private final SubscriptionRepository subscriptionRepository;
     private final SubscriptionMutationTransactions mutations;
+    private final Clock clock;
 
     public SubscriptionService(SubscriptionRepository subscriptionRepository,
-                                SubscriptionMutationTransactions mutations) {
+                                SubscriptionMutationTransactions mutations, Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.mutations = mutations;
+        this.clock = clock;
     }
 
     public Subscription subscribe(Long userId, Long planId, Long tierId) {
@@ -87,7 +89,7 @@ public class SubscriptionService {
                 .findFirstByUserIdOrderByStartDateDesc(userId)
                 .orElseThrow(() -> new NotFoundException("No subscription found for user " + userId));
 
-        if (subscription.getStatus() == SubscriptionStatus.ACTIVE && !subscription.isCurrentlyActive(Instant.now())) {
+        if (subscription.getStatus() == SubscriptionStatus.ACTIVE && !subscription.isCurrentlyActive(clock.instant())) {
             subscription.setStatus(SubscriptionStatus.EXPIRED);
             subscriptionRepository.save(subscription);
         }
