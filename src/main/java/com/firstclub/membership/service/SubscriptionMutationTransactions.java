@@ -44,6 +44,7 @@ public class SubscriptionMutationTransactions {
     private final ActiveMembershipLockRepository lockRepository;
     private final PlanVersionRepository planVersionRepository;
     private final SubscriptionIdempotencyRepository idempotencyRepository;
+    private final CallerIdentityGuard callerIdentityGuard;
     private final Clock clock;
 
     public SubscriptionMutationTransactions(SubscriptionRepository subscriptionRepository,
@@ -53,6 +54,7 @@ public class SubscriptionMutationTransactions {
                                              ActiveMembershipLockRepository lockRepository,
                                              PlanVersionRepository planVersionRepository,
                                              SubscriptionIdempotencyRepository idempotencyRepository,
+                                             CallerIdentityGuard callerIdentityGuard,
                                              Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.userRepository = userRepository;
@@ -61,6 +63,7 @@ public class SubscriptionMutationTransactions {
         this.lockRepository = lockRepository;
         this.planVersionRepository = planVersionRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.callerIdentityGuard = callerIdentityGuard;
         this.clock = clock;
     }
 
@@ -142,9 +145,10 @@ public class SubscriptionMutationTransactions {
      * check CheckoutController already applies for the same reason - see that class's comment.
      */
     @Transactional
-    public Subscription changeTier(Long subscriptionId, Long newTierId) {
+    public Subscription changeTier(Long subscriptionId, Long newTierId, Long callerUserId) {
         Subscription subscription = subscriptionRepository.findById(subscriptionId)
                 .orElseThrow(() -> new NotFoundException("Subscription not found: " + subscriptionId));
+        callerIdentityGuard.requireOwnership(callerUserId, subscription.getUser().getId());
         stateMachine.assertTierChangeAllowed(subscription.getStatus());
         if (!subscription.isCurrentlyActive(clock.instant())) {
             throw new InvalidTransitionException(
@@ -167,9 +171,10 @@ public class SubscriptionMutationTransactions {
      * constraint, producing a false-positive 409 for a user who has nothing active at all.
      */
     @Transactional
-    public Subscription cancel(Long subscriptionId) {
+    public Subscription cancel(Long subscriptionId, Long callerUserId) {
         Subscription subscription = subscriptionRepository.findById(subscriptionId)
                 .orElseThrow(() -> new NotFoundException("Subscription not found: " + subscriptionId));
+        callerIdentityGuard.requireOwnership(callerUserId, subscription.getUser().getId());
         stateMachine.assertTransitionAllowed(subscription.getStatus(), SubscriptionStatus.CANCELLED);
         subscription.setStatus(SubscriptionStatus.CANCELLED);
         subscription.setEndDate(clock.instant());

@@ -5,6 +5,7 @@ import com.firstclub.membership.dto.OrderDtos.OrderPlacedResponse;
 import com.firstclub.membership.dto.OrderDtos.OrderResponse;
 import com.firstclub.membership.dto.OrderDtos.PlaceOrderRequest;
 import com.firstclub.membership.repository.SubscriptionRepository;
+import com.firstclub.membership.service.CallerIdentityGuard;
 import com.firstclub.membership.service.OrderService;
 import com.firstclub.membership.service.OrderService.PlaceOrderResult;
 import jakarta.validation.Valid;
@@ -22,15 +23,20 @@ public class OrderController {
 
     private final OrderService orderService;
     private final SubscriptionRepository subscriptionRepository;
+    private final CallerIdentityGuard callerIdentityGuard;
 
-    public OrderController(OrderService orderService, SubscriptionRepository subscriptionRepository) {
+    public OrderController(OrderService orderService, SubscriptionRepository subscriptionRepository,
+                            CallerIdentityGuard callerIdentityGuard) {
         this.orderService = orderService;
         this.subscriptionRepository = subscriptionRepository;
+        this.callerIdentityGuard = callerIdentityGuard;
     }
 
     @PostMapping("/users/{userId}/orders")
-    public ResponseEntity<OrderPlacedResponse> placeOrder(@PathVariable Long userId,
+    public ResponseEntity<OrderPlacedResponse> placeOrder(@RequestHeader(value = "X-User-Id", required = false) String callerUserIdHeader,
+                                                            @PathVariable Long userId,
                                                             @Valid @RequestBody PlaceOrderRequest request) {
+        callerIdentityGuard.requireCallerOwns(callerUserIdHeader, userId);
         PlaceOrderResult result = orderService.placeOrder(userId, request.value());
         String currentTier = subscriptionRepository
                 .findFirstByUserIdOrderByStartDateDesc(userId)
@@ -42,8 +48,9 @@ public class OrderController {
     }
 
     @PostMapping("/orders/{orderId}/cancel")
-    public OrderResponse cancelOrder(@PathVariable Long orderId) {
-        return toResponse(orderService.cancelOrder(orderId));
+    public OrderResponse cancelOrder(@RequestHeader(value = "X-User-Id", required = false) String callerUserIdHeader, @PathVariable Long orderId) {
+        Long callerUserId = callerIdentityGuard.requireCaller(callerUserIdHeader);
+        return toResponse(orderService.cancelOrder(orderId, callerUserId));
     }
 
     private OrderResponse toResponse(OrderRecord order) {

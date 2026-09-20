@@ -18,12 +18,17 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: update
+      # Schema is now owned by Flyway (src/main/resources/db/migration) instead of
+      # Hibernate's auto-DDL - see V1__init_schema.sql for why `none` rather than `validate`.
+      ddl-auto: none
     show-sql: false
     properties:
       hibernate:
         format_sql: true
     open-in-view: false
+
+  flyway:
+    enabled: true
 
 logging:
   level:

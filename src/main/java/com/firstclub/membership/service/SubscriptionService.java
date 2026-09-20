@@ -77,14 +77,14 @@ public class SubscriptionService {
         }
     }
 
-    public Subscription changeTier(Long subscriptionId, Long newTierId) {
+    public Subscription changeTier(Long subscriptionId, Long newTierId, Long callerUserId) {
         return withOptimisticRetry("change tier for subscription " + subscriptionId,
-                () -> mutations.changeTier(subscriptionId, newTierId));
+                () -> mutations.changeTier(subscriptionId, newTierId, callerUserId));
     }
 
-    public Subscription cancel(Long subscriptionId) {
+    public Subscription cancel(Long subscriptionId, Long callerUserId) {
         return withOptimisticRetry("cancel subscription " + subscriptionId,
-                () -> mutations.cancel(subscriptionId));
+                () -> mutations.cancel(subscriptionId, callerUserId));
     }
 
     private Subscription withOptimisticRetry(String description, java.util.function.Supplier<Subscription> attempt) {

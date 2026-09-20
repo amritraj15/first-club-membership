@@ -189,11 +189,30 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and exposes
   entitlements; it does not reach into a sales system or support-routing system to enforce them.
   Those downstream systems should consume the entitlement through their own service boundaries.
-- **Full authorization boundaries / admin-vs-user API separation** - user-facing endpoints still
-  do not have an identity layer. Admin mutation routes are protected by `X-Admin-Api-Key` for the
-  exercise. Production should replace that guard with the platform's normal identity/RBAC model.
+- **Full authorization boundaries / admin-vs-user API separation** - every mutating user-scoped
+  endpoint (subscribe, change tier, cancel, place/cancel an order, reconcile tier) now requires
+  an `X-User-Id` header, verified against the resource's actual owner by `CallerIdentityGuard`
+  before any mutation runs. This is explicitly NOT authentication - the header is self-asserted,
+  not checked against a password/token/session - so it stops accidental or casual cross-user
+  calls, not a determined attacker who can set an arbitrary header. Read-only endpoints (`GET
+  /membership`, `GET /plans`, `GET /tiers`, checkout benefit calculation, exclusive deals) are
+  NOT covered - the guard is scoped to state-mutating actions, where an unauthenticated caller
+  could do real harm, not to every place a user id appears in a URL. Admin mutation routes keep
+  their separate `X-Admin-Api-Key` guard. Production should replace `CallerIdentityGuard`'s
+  header check with the platform's real identity/session layer; every call site only needs that
+  one method's return value to change.
 - **Full production observability** - promotions, demotions, conflicts, and reconciliation events
   are logged through SLF4J, but the service does not add a metrics/trace/audit platform.
+- **Schema migration tooling: now Flyway, not further scoped down** - `V1__init_schema.sql`
+  replaces Hibernate's `ddl-auto: update` for both H2 and Postgres. `ddl-auto` is `none` rather
+  than the stricter `validate`: validate would be the more correct pairing (Hibernate checking
+  its expected schema against what Flyway created), but confirming an exact column-by-column
+  match against a live schema export wasn't possible in the environment this migration was
+  written in. Every functional constraint the app actually depends on - PKs, FKs, uniqueness on
+  `ActiveMembershipLock.userId` and the idempotency-key pair - is still enforced at the DB level;
+  run the full test suite after pulling this change, since `MembershipApiIntegrationTest`
+  exercises nearly every column and constraint here and will surface a real mismatch as a test
+  failure rather than a silent drift.
 
 ## Suggestions reviewed (from the implementation-review pass)
 
@@ -219,7 +238,7 @@ disposition of each - what got fixed, what got documented instead of built, and 
 | 15 | Richer benefit definition (priority, stackable flag, JSON config blob) | **Not done** - the current `type + paramValue + scope` shape covers everything the spec asks for; a generic config blob would trade compile-time safety for flexibility this exercise doesn't need yet. |
 | 16 | Idempotency keys for subscribe | **Fixed.** `Idempotency-Key` is persisted per user and replayed safely; a reused key with different parameters returns 409. User-row locking makes the operation safe across application servers sharing the same database. |
 | 17 | HTTP status code mapping (409/422/etc.) | **Fixed** the one real gap: `InvalidTransitionException` now returns 422, not 400. Cancel intentionally still returns 200 + body (not 204) - showing the resulting `CANCELLED` state is more useful for a demo than an empty response, a deliberate choice, not an oversight. |
-| 18 | Authorization boundaries | **Partially addressed.** Admin benefit mutation is API-key protected; a full user/admin identity model remains out of scope. |
+| 18 | Authorization boundaries | **Fixed for mutations.** `CallerIdentityGuard` requires and verifies `X-User-Id` on every mutating user-scoped endpoint; admin routes keep `X-Admin-Api-Key`. Read endpoints and a real identity/session layer remain out of scope - see "deliberately not implemented" above. |
 | 19 | Pricing/benefit versioning & effective dates | **Fixed for plan pricing.** Immutable `PlanVersion` is captured by each subscription; admin price changes create a new version and existing subscriptions retain the old price. |
 | 20 | Observability (metrics, structured logs) | **Not done** beyond existing SLF4J logging - noted as a real gap. |
 
@@ -251,6 +270,7 @@ Example:
 ```bash
 curl -s -X POST localhost:8080/api/subscriptions \
   -H "Content-Type: application/json" \
+  -H "X-User-Id: 42" \
   -H "Idempotency-Key: subscribe-user-42-001" \
   -d '{"userId":42,"planId":1,"tierId":1}' | jq
 ```
@@ -295,7 +315,7 @@ curl -s localhost:8080/api/tiers | jq
 
 # 2. Subscribe user 1 to the Monthly plan at Silver tier, retaining the returned subscription id
 SUB_ID=$(curl -s -X POST localhost:8080/api/subscriptions \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 1" \
   -d '{"userId": 1, "planId": 1, "tierId": 1}' | tee /dev/stderr | jq -r .subscriptionId)
 
 # 3. Track current membership
@@ -304,18 +324,18 @@ curl -s localhost:8080/api/users/1/membership | jq
 # 4. Place 11 orders of value 100 each - crosses Gold's ">10 orders" criterion
 for i in $(seq 1 11); do
   curl -s -X POST localhost:8080/api/users/1/orders \
-    -H "Content-Type: application/json" -d '{"value": 100}' > /dev/null
+    -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"value": 100}' > /dev/null
 done
 curl -s localhost:8080/api/users/1/membership | jq   # tierName should now be GOLD, tierSource SYSTEM_PROMOTED
 
 # 5. User manually downgrades back to Silver - system must NOT immediately re-promote
 curl -s -X PATCH localhost:8080/api/subscriptions/$SUB_ID/tier \
-  -H "Content-Type: application/json" -d '{"newTierId": 1}' | jq
+  -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"newTierId": 1}' | jq
 curl -s localhost:8080/api/users/1/membership | jq   # tierName SILVER, tierSource USER_SELECTED
 
 # 6. One more order re-enters automatic evaluation - should promote back to GOLD
 curl -s -X POST localhost:8080/api/users/1/orders \
-  -H "Content-Type: application/json" -d '{"value": 100}' | jq
+  -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"value": 100}' | jq
 curl -s localhost:8080/api/users/1/membership | jq   # back to GOLD, SYSTEM_PROMOTED
 
 # 7. Checkout benefits for a cart - user 1 is on GOLD at this point (free delivery + 5% off ALL)
@@ -325,16 +345,16 @@ curl -s -X POST localhost:8080/api/users/1/checkout/benefits \
 # expect totalDiscount = 125.00 (5% of the 2500 cart total), freeDelivery = true
 
 # 8. Illegal transition - cancel twice
-curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID | jq
-curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID -w "\nHTTP %{http_code}\n"   # expect 422
+curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID -H "X-User-Id: 1" | jq
+curl -s -X DELETE localhost:8080/api/subscriptions/$SUB_ID -H "X-User-Id: 1" -w "\nHTTP %{http_code}\n"   # expect 422
 
 # 8b. Cancelling frees the "slot" - re-subscribing for the same user now succeeds
 curl -s -X POST localhost:8080/api/subscriptions \
-  -H "Content-Type: application/json" -d '{"userId": 1, "planId": 1, "tierId": 1}' | jq
+  -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"userId": 1, "planId": 1, "tierId": 1}' | jq
 
 # 9. Cohort-based promotion - user 2 (VIP) qualifies for Platinum with zero orders
 curl -s -X POST localhost:8080/api/subscriptions \
-  -H "Content-Type: application/json" -d '{"userId": 2, "planId": 1, "tierId": 3}' | jq
+  -H "Content-Type: application/json" -H "X-User-Id: 2" -d '{"userId": 2, "planId": 1, "tierId": 3}' | jq
 curl -s localhost:8080/api/users/2/membership | jq
 
 # 10. Discount stacking policy - user 2 is on PLATINUM,
@@ -346,7 +366,7 @@ curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
 # expect totalDiscount = 200.00 (150 Electronics @15% + 50 Groceries @10%), NOT 300.00
 
 # 11. Manual reconciliation - re-run tier evaluation on demand without a new order
-curl -s -X POST localhost:8080/api/users/2/reconcile-tier | jq
+curl -s -X POST localhost:8080/api/users/2/reconcile-tier -H "X-User-Id: 2" | jq
 
 # 11b. Platinum exclusive deal + entitlement. Beauty gets its exclusive 20%, not the global 10%;
 #      EARLY_ACCESS reports configuredValue 7 and scope DAYS.
@@ -362,9 +382,9 @@ curl -s -X POST localhost:8080/api/users \
   -H "Content-Type: application/json" \
   -d '{"name": "Race Test", "email": "race@example.com"}' | jq
 # note the returned id, then run both concurrently:
-curl -s -X POST localhost:8080/api/subscriptions -H "Content-Type: application/json" \
+curl -s -X POST localhost:8080/api/subscriptions -H "Content-Type: application/json" -H "X-User-Id: <id>" \
   -d '{"userId": <id>, "planId": 1, "tierId": 1}' -w "\nHTTP %{http_code}\n" &
-curl -s -X POST localhost:8080/api/subscriptions -H "Content-Type: application/json" \
+curl -s -X POST localhost:8080/api/subscriptions -H "Content-Type: application/json" -H "X-User-Id: <id>" \
   -d '{"userId": <id>, "planId": 1, "tierId": 2}' -w "\nHTTP %{http_code}\n" &
 wait
 # The automated version of this exact scenario, with 8 concurrent requests instead of 2, is
@@ -372,11 +392,11 @@ wait
 
 # 13. Same-key idempotency - retry the exact same subscription request with the same key.
 curl -s -X POST localhost:8080/api/subscriptions \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 42" \
   -H "Idempotency-Key: subscribe-user-42-002" \
   -d '{"userId":42, "planId":1, "tierId":1}' | jq
 curl -s -X POST localhost:8080/api/subscriptions \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 42" \
   -H "Idempotency-Key: subscribe-user-42-002" \
   -d '{"userId":42, "planId":1, "tierId":1}' | jq
 # The second request replays the original subscription instead of creating another one.

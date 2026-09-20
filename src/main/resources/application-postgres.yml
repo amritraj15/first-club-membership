@@ -6,5 +6,5 @@ spring:
     password: ${DB_PASSWORD:membership}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: none
     open-in-view: false

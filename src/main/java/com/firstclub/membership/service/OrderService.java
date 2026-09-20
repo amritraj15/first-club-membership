@@ -31,17 +31,20 @@ public class OrderService {
     private final UserRepository userRepository;
     private final SubscriptionRepository subscriptionRepository;
     private final TierEvaluationService tierEvaluationService;
+    private final CallerIdentityGuard callerIdentityGuard;
     private final Clock clock;
 
     public OrderService(OrderRecordRepository orderRecordRepository,
                          UserRepository userRepository,
                          SubscriptionRepository subscriptionRepository,
                          TierEvaluationService tierEvaluationService,
+                         CallerIdentityGuard callerIdentityGuard,
                          Clock clock) {
         this.orderRecordRepository = orderRecordRepository;
         this.userRepository = userRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.tierEvaluationService = tierEvaluationService;
+        this.callerIdentityGuard = callerIdentityGuard;
         this.clock = clock;
     }
 
@@ -66,8 +69,8 @@ public class OrderService {
         return new PlaceOrderResult(order, tierChanged);
     }
 
-    public OrderRecord cancelOrder(Long orderId) {
-        OrderRecord order = markCancelledAndClearOverride(orderId);
+    public OrderRecord cancelOrder(Long orderId, Long callerUserId) {
+        OrderRecord order = markCancelledAndClearOverride(orderId, callerUserId);
         tierEvaluationService.reevaluateSafely(order.getUser().getId());
         return order;
     }
@@ -84,9 +87,10 @@ public class OrderService {
         return order;
     }
 
-    OrderRecord markCancelledAndClearOverride(Long orderId) {
+    OrderRecord markCancelledAndClearOverride(Long orderId, Long callerUserId) {
         OrderRecord order = orderRecordRepository.findById(orderId)
                 .orElseThrow(() -> new NotFoundException("Order not found: " + orderId));
+        callerIdentityGuard.requireOwnership(callerUserId, order.getUser().getId());
         order.setCancelled(true);
         order = orderRecordRepository.save(order);
         clearManualOverrideIfPresent(order.getUser().getId());
