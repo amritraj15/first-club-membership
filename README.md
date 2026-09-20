@@ -10,7 +10,7 @@ support for shared multi-server deployments, no external services required.
 Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn clean install` lifecycle passes:
 
 ```text
-Tests run: 32, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 44, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
@@ -47,7 +47,26 @@ mvn test
 
 This runs all three kinds of test in the suite:
 - **Unit tests** (`strategy/TierEvaluatorTest`, `service/SubscriptionStateMachineTest`,
-  `service/QualificationWindowResolverTest`) - plain JUnit 5, no Spring context, fast.
+  `service/QualificationWindowResolverTest`, `service/CategoryOverridesGlobalDiscountPolicyTest`,
+  `service/SubscriptionMutationTransactionsTest`,
+  `service/SubscriptionServiceDataIntegrityRaceTest`) - plain JUnit 5, no Spring context, fast.
+  The last two use Mockito for repository INTERFACES only, never for concrete classes
+  (`Subscription`, `User`, `SubscriptionMutationTransactions`, etc.) - those are exercised as
+  real constructed objects or, for `SubscriptionMutationTransactions`, a plain subclass that
+  overrides one method. This isn't a style choice: Mockito's default mock maker instruments
+  concrete classes via a runtime-attached Java agent, and that attachment does not work on every
+  JDK - confirmed failing with "Could not modify all classes" on a JDK 27 build. Real objects
+  and subclassing are ordinary `javac`-compiled Java with no agent involved, so they work
+  regardless of JDK version; see either test class's Javadoc for the full reasoning. The three
+  newer ones close specific, previously HTTP-only-covered gaps: the discount-stacking arithmetic
+  in isolation rather than through a full checkout round-trip; `changeTier` rejecting a
+  subscription that is stale-ACTIVE (status not yet lazily corrected, but actually expired) - a
+  state nothing in the integration suite forces directly, since every subscription it creates is
+  freshly active; and `subscribe`'s `DataIntegrityViolationException` recovery correctly
+  distinguishing an idempotency-key race (replay), a known `ActiveMembershipLock` race (409, not
+  a raw 500 - `GlobalExceptionHandler` has no handler for that exception type on purpose), and a
+  genuinely unrecognized violation (still surfaces loudly, rather than guessing at a
+  business-logic response for something the code doesn't understand).
 - **Repository-layer test** (`repository/SubscriptionRepositoryPaginationTest`) - `@DataJpaTest`
   against the real H2 + Flyway schema (not a mock), proving
   `TierReconciliationScheduler`'s paginated user-id sweep visits every active user exactly once
@@ -118,13 +137,25 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   parameters and resulting subscription so a retry returns the original subscription. Reusing
   the same key with different request parameters returns 409. The concurrent same-key integration
   test verifies that concurrent identical requests produce one subscription and deterministic
-  replay rather than duplicate membership creation.
+  replay rather than duplicate membership creation. `SubscriptionService.subscribe`'s catch
+  block distinguishes three outcomes for a `DataIntegrityViolationException` surfacing from that
+  race: an idempotency-key match (replay), an `ActiveMembershipLock` constraint match (409 - the
+  same response the pessimistic-lock path already gives for the identical situation, translated
+  rather than left to surface as an unhandled 500, since `GlobalExceptionHandler` intentionally
+  has no handler for that exception type), or neither (re-thrown raw, since inventing a
+  business-logic response for an unrecognized violation would be worse than a loud failure). See
+  `SubscriptionServiceDataIntegrityRaceTest` for all three cases exercised directly - the
+  pessimistic lock makes the constraint-violation paths themselves essentially unreachable
+  through an ordinary HTTP/integration-test run, which is exactly why a unit test with a mocked
+  `SubscriptionMutationTransactions` exists for them rather than relying on the integration suite.
 - **Discount stacking is policy-driven, not accumulated ad-hoc** (`DiscountPolicy` interface,
   `CategoryOverridesGlobalDiscountPolicy` implementation). A tier with both an ALL-scope and a
   category-scope `PERCENTAGE_DISCOUNT` benefit resolves to exactly ONE rate per cart item
   (category-specific wins if present, otherwise the ALL-scope rate) - not the sum of both. See
   that class's Javadoc for the alternatives considered (stacking, highest-wins) and why this one
-  was chosen.
+  was chosen. `CategoryOverridesGlobalDiscountPolicyTest` exercises the policy directly (no
+  Spring context, no HTTP) in addition to the integration test that already covered it end to
+  end through a full checkout call.
 - **Qualification windows are criterion-level data.** Calendar month is the default, resolved in
   the configured `membership.qualification.zone-id` (`Asia/Kolkata` by default); individual
   criteria can opt into rolling days. The Platinum order-value criterion demonstrates the latter.
@@ -140,7 +171,12 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   deterministic in unit tests and keeps a single business-time source in production.
 - **Expiry is computed lazily on read** (`Subscription.isCurrentlyActive`), not solely by a
   background job - a missed cron run can never make an expired subscription look active, and
-  `GET /users/{id}/membership` self-corrects the persisted status on read.
+  `GET /users/{id}/membership` self-corrects the persisted status on read. `changeTier` applies
+  the same liveness check before mutating (see `SubscriptionMutationTransactions.changeTier`'s
+  Javadoc for why a stale-ACTIVE-but-expired subscription must be rejected there too, not just
+  on read) - `SubscriptionMutationTransactionsTest` forces that exact state directly with a
+  mocked subscription, since nothing in the integration suite creates a subscription that's
+  already expired.
 - **Plan pricing is immutable at the subscription level** through `PlanVersion`. The current
   `Plan` price represents the latest catalog version; a subscription stores the exact version
   purchased. Admin price changes create a new version rather than mutating a historical version,

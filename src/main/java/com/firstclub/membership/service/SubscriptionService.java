@@ -5,6 +5,7 @@ import com.firstclub.membership.domain.SubscriptionStatus;
 import com.firstclub.membership.domain.SubscriptionIdempotency;
 import com.firstclub.membership.exception.ConflictException;
 import com.firstclub.membership.exception.NotFoundException;
+import com.firstclub.membership.repository.ActiveMembershipLockRepository;
 import com.firstclub.membership.repository.SubscriptionRepository;
 import com.firstclub.membership.repository.SubscriptionIdempotencyRepository;
 import org.slf4j.Logger;
@@ -29,7 +30,12 @@ import java.util.Optional;
  * {@link ObjectOptimisticLockingFailureException}, then a 409 to the caller. Subscription
  * creation has a separate integrity-race recovery: if the database unique constraint is won by a
  * concurrent request using the same idempotency key, the failed transaction is discarded and the
- * committed subscription is replayed from a fresh repository transaction.
+ * committed subscription is replayed from a fresh repository transaction. If the constraint that
+ * fired is instead {@code ActiveMembershipLock}'s uniqueness (the pessimistic user-row lock
+ * should make this unreachable in practice, but "should" isn't "is"), that's translated to the
+ * same 409 the lock-check path already returns, rather than left to surface as an unhandled
+ * {@code DataIntegrityViolationException} - see {@link #subscribe}'s inline comments for exactly
+ * which case gets which treatment, and which residual case is deliberately left unhandled.
  */
 @Service
 public class SubscriptionService {
@@ -40,14 +46,17 @@ public class SubscriptionService {
     private final SubscriptionMutationTransactions mutations;
     private final Clock clock;
     private final SubscriptionIdempotencyRepository idempotencyRepository;
+    private final ActiveMembershipLockRepository lockRepository;
 
     public SubscriptionService(SubscriptionRepository subscriptionRepository,
                                 SubscriptionMutationTransactions mutations, Clock clock,
-                                SubscriptionIdempotencyRepository idempotencyRepository) {
+                                SubscriptionIdempotencyRepository idempotencyRepository,
+                                ActiveMembershipLockRepository lockRepository) {
         this.subscriptionRepository = subscriptionRepository;
         this.mutations = mutations;
         this.clock = clock;
         this.idempotencyRepository = idempotencyRepository;
+        this.lockRepository = lockRepository;
     }
 
     public Subscription subscribe(Long userId, Long planId, Long tierId, String idempotencyKey) {
@@ -58,21 +67,37 @@ public class SubscriptionService {
             // A concurrent request can win the unique (user_id, idempotency_key) constraint
             // after both requests initially observe "no record". The failed transaction must
             // be discarded; replay is deliberately performed through a fresh transaction.
-            if (key == null || key.isBlank()) {
-                throw constraintRace;
-            }
-            Optional<SubscriptionIdempotency> existing = idempotencyRepository
-                    .findByUserIdAndIdempotencyKey(userId, key);
-            if (existing.isPresent()) {
-                SubscriptionIdempotency record = existing.get();
-                if (!record.getPlanId().equals(planId) || !record.getTierId().equals(tierId)) {
-                    throw new ConflictException(
-                            "Idempotency-Key was already used with different subscription parameters");
+            if (key != null && !key.isBlank()) {
+                Optional<SubscriptionIdempotency> existing = idempotencyRepository
+                        .findByUserIdAndIdempotencyKey(userId, key);
+                if (existing.isPresent()) {
+                    SubscriptionIdempotency record = existing.get();
+                    if (!record.getPlanId().equals(planId) || !record.getTierId().equals(tierId)) {
+                        throw new ConflictException(
+                                "Idempotency-Key was already used with different subscription parameters");
+                    }
+                    return record.getSubscription();
                 }
-                return record.getSubscription();
             }
-            // No idempotency record means this was some other integrity race (for example,
-            // an active-membership guard). Do not convert that unrelated conflict into a replay.
+            // Not an idempotency-key race (no key was given, or the key didn't resolve to a
+            // record). The remaining KNOWN cause of a unique-constraint failure inside
+            // createSubscription is the ActiveMembershipLock invariant - the pessimistic
+            // user-row lock should make that essentially unreachable in practice (see
+            // createSubscription's javadoc), but "should be unreachable" is not the same
+            // guarantee as "is unreachable": a lock-acquisition edge case, a future code path
+            // that bypasses the lock, or a different isolation configuration could still land
+            // here. GlobalExceptionHandler has no handler for DataIntegrityViolationException on
+            // purpose - a raw constraint violation is not normally something that should get a
+            // free translation to a business-logic response - so without this check, this
+            // specific, well-understood case would surface as an unhandled 500 instead of the
+            // same 409 the pessimistic-lock path already returns for the identical situation.
+            if (lockRepository.findByUserId(userId).isPresent()) {
+                throw new ConflictException(
+                        "User " + userId + " already has an active subscription - cancel it before subscribing again");
+            }
+            // A genuinely unrecognized integrity violation - do not invent a business-logic
+            // response for something this code doesn't understand; a loud 500 here is more
+            // honest than guessing at a 409 that might be masking a real bug.
             throw constraintRace;
         }
     }
