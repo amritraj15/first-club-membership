@@ -9,6 +9,8 @@ import com.firstclub.membership.dto.ExclusiveDealDtos.ExclusiveDealResponse;
 import com.firstclub.membership.dto.OrderDtos.OrderPlacedResponse;
 import com.firstclub.membership.dto.OrderDtos.PlaceOrderRequest;
 import com.firstclub.membership.dto.PlanDtos.PlanResponse;
+import com.firstclub.membership.dto.AdminPlanDtos.PlanPriceAdminResponse;
+import com.firstclub.membership.dto.AdminPlanDtos.UpdatePlanPriceRequest;
 import com.firstclub.membership.dto.PlanDtos.TierResponse;
 import com.firstclub.membership.dto.SubscriptionDtos.ChangeTierRequest;
 import com.firstclub.membership.dto.SubscriptionDtos.MembershipStatusResponse;
@@ -374,4 +376,106 @@ class MembershipApiIntegrationTest {
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertEquals(false, response.getBody().get("tierChanged"));
     }
+    @Test
+    void sameIdempotencyKeyReplaysOriginalSubscription() {
+        Long userId = createUser("Idempotent", "idempotent+" + System.nanoTime() + "@example.com", null);
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Idempotency-Key", "subscribe-" + System.nanoTime());
+        HttpEntity<SubscribeRequest> request = new HttpEntity<>(
+                new SubscribeRequest(userId, monthlyPlanId, silverTierId), headers);
+
+        ResponseEntity<MembershipStatusResponse> first = rest.postForEntity(
+                url("/api/subscriptions"), request, MembershipStatusResponse.class);
+        ResponseEntity<MembershipStatusResponse> replay = rest.postForEntity(
+                url("/api/subscriptions"), request, MembershipStatusResponse.class);
+
+        assertEquals(HttpStatus.CREATED, first.getStatusCode());
+        assertEquals(HttpStatus.CREATED, replay.getStatusCode());
+        assertEquals(first.getBody().subscriptionId(), replay.getBody().subscriptionId());
+    }
+
+    @Test
+    void sameIdempotencyKeyWithDifferentParametersIsRejected() {
+        Long userId = createUser("IdempotencyConflict", "idempotency-conflict+" + System.nanoTime() + "@example.com", null);
+        String key = "same-key-" + System.nanoTime();
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Idempotency-Key", key);
+
+        ResponseEntity<MembershipStatusResponse> first = rest.postForEntity(
+                url("/api/subscriptions"),
+                new HttpEntity<>(new SubscribeRequest(userId, monthlyPlanId, silverTierId), headers),
+                MembershipStatusResponse.class);
+        assertEquals(HttpStatus.CREATED, first.getStatusCode());
+
+        ResponseEntity<Map> conflict = rest.postForEntity(
+                url("/api/subscriptions"),
+                new HttpEntity<>(new SubscribeRequest(userId, monthlyPlanId, goldTierId), headers),
+                Map.class);
+        assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+    }
+
+    @Test
+    void planPriceChangeCreatesNewVersionAndExistingSubscriptionIsGrandfathered() {
+        Long userId = createUser("Grandfather", "grandfather+" + System.nanoTime() + "@example.com", null);
+        ResponseEntity<MembershipStatusResponse> existing = rest.postForEntity(
+                url("/api/subscriptions"),
+                new SubscribeRequest(userId, monthlyPlanId, silverTierId),
+                MembershipStatusResponse.class);
+        assertEquals(HttpStatus.CREATED, existing.getStatusCode());
+        int oldVersion = existing.getBody().planPriceVersion();
+        BigDecimal oldPrice = existing.getBody().price();
+
+        ResponseEntity<PlanPriceAdminResponse> updated = rest.exchange(
+                url("/api/admin/plans/" + monthlyPlanId + "/price"),
+                org.springframework.http.HttpMethod.PATCH,
+                new HttpEntity<>(new UpdatePlanPriceRequest(new BigDecimal("249.00"), "INR"), adminHeaders()),
+                PlanPriceAdminResponse.class);
+
+        assertEquals(HttpStatus.OK, updated.getStatusCode());
+        assertTrue(updated.getBody().version() > oldVersion);
+        assertEquals(0, new BigDecimal("249.00").compareTo(updated.getBody().price()));
+
+        ResponseEntity<Map> oldMembership = rest.getForEntity(
+                url("/api/users/" + userId + "/membership"), Map.class);
+        assertEquals(oldVersion, ((Number) oldMembership.getBody().get("planPriceVersion")).intValue());
+        assertEquals(0, oldPrice.compareTo(new BigDecimal(oldMembership.getBody().get("price").toString())));
+
+        Long newUserId = createUser("NewPrice", "new-price+" + System.nanoTime() + "@example.com", null);
+        ResponseEntity<MembershipStatusResponse> newer = rest.postForEntity(
+                url("/api/subscriptions"),
+                new SubscribeRequest(newUserId, monthlyPlanId, silverTierId),
+                MembershipStatusResponse.class);
+        assertEquals(HttpStatus.CREATED, newer.getStatusCode());
+        assertEquals(updated.getBody().version(), newer.getBody().planPriceVersion());
+        assertEquals(0, new BigDecimal("249.00").compareTo(newer.getBody().price()));
+    }
+
+    @Test
+    void concurrentSameIdempotencyKeyReturnsOneSubscription() throws Exception {
+        Long userId = createUser("ConcurrentIdempotency", "concurrent-idempotency+" + System.nanoTime() + "@example.com", null);
+        String key = "concurrent-key-" + System.nanoTime();
+        int attempts = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<Long>> futures = IntStream.range(0, attempts).mapToObj(i -> pool.submit(() -> {
+            gate.await();
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Idempotency-Key", key);
+            ResponseEntity<MembershipStatusResponse> response = rest.postForEntity(
+                    url("/api/subscriptions"),
+                    new HttpEntity<>(new SubscribeRequest(userId, monthlyPlanId, silverTierId), headers),
+                    MembershipStatusResponse.class);
+            return response.getBody().subscriptionId();
+        })).toList();
+        gate.countDown();
+
+        List<Long> ids = futures.stream().map(f -> {
+            try { return f.get(10, TimeUnit.SECONDS); }
+            catch (Exception e) { throw new RuntimeException(e); }
+        }).toList();
+        pool.shutdown();
+
+        assertEquals(1, ids.stream().distinct().count());
+    }
+
 }

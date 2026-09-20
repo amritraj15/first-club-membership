@@ -46,6 +46,10 @@ public class Subscription {
     @JoinColumn(name = "tier_id", nullable = false)
     private Tier tier;
 
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "plan_version_id", nullable = false)
+    private PlanVersion planVersion;
+
     @Enumerated(EnumType.STRING)
     private SubscriptionStatus status;
 
@@ -67,9 +71,10 @@ public class Subscription {
         // JPA
     }
 
-    public Subscription(User user, Plan plan, Tier tier, Instant startDate, Instant endDate) {
+    public Subscription(User user, Plan plan, PlanVersion planVersion, Tier tier, Instant startDate, Instant endDate) {
         this.user = user;
         this.plan = plan;
+        this.planVersion = planVersion;
         this.tier = tier;
         this.status = SubscriptionStatus.ACTIVE;
         this.tierSource = TierSource.USER_SELECTED;
@@ -91,6 +96,10 @@ public class Subscription {
 
     public Tier getTier() {
         return tier;
+    }
+
+    public PlanVersion getPlanVersion() {
+        return planVersion;
     }
 
     public void setTier(Tier tier) {

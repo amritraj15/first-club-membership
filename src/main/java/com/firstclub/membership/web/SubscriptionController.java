@@ -34,8 +34,10 @@ public class SubscriptionController {
     }
 
     @PostMapping("/subscriptions")
-    public ResponseEntity<MembershipStatusResponse> subscribe(@Valid @RequestBody SubscribeRequest request) {
-        Subscription subscription = subscriptionService.subscribe(request.userId(), request.planId(), request.tierId());
+    public ResponseEntity<MembershipStatusResponse> subscribe(
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @Valid @RequestBody SubscribeRequest request) {
+        Subscription subscription = subscriptionService.subscribe(request.userId(), request.planId(), request.tierId(), idempotencyKey);
         return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(subscription));
     }
 
@@ -83,7 +85,10 @@ public class SubscriptionController {
                 s.getTierSource().name(),
                 s.getStartDate().toString(),
                 s.getEndDate().toString(),
-                daysRemaining
+                daysRemaining,
+                s.getPlanVersion().getVersionNumber(),
+                s.getPlanVersion().getPrice(),
+                s.getPlanVersion().getCurrency()
         );
     }
 }

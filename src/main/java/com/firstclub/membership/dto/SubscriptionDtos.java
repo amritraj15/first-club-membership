@@ -28,7 +28,10 @@ public class SubscriptionDtos {
             String tierSource,
             String startDate,
             String endDate,
-            long daysRemaining
+            long daysRemaining,
+            int planPriceVersion,
+            java.math.BigDecimal price,
+            String currency
     ) {
     }
 }

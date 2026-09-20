@@ -2,19 +2,21 @@ package com.firstclub.membership.service;
 
 import com.firstclub.membership.domain.ActiveMembershipLock;
 import com.firstclub.membership.domain.Plan;
+import com.firstclub.membership.domain.PlanVersion;
+import com.firstclub.membership.domain.SubscriptionIdempotency;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
 import com.firstclub.membership.domain.Tier;
 import com.firstclub.membership.domain.TierSource;
 import com.firstclub.membership.domain.User;
 import com.firstclub.membership.exception.ConflictException;
+import com.firstclub.membership.exception.InvalidTransitionException;
 import com.firstclub.membership.exception.NotFoundException;
 import com.firstclub.membership.repository.ActiveMembershipLockRepository;
 import com.firstclub.membership.repository.SubscriptionRepository;
+import com.firstclub.membership.repository.PlanVersionRepository;
+import com.firstclub.membership.repository.SubscriptionIdempotencyRepository;
 import com.firstclub.membership.repository.UserRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -35,13 +37,13 @@ import java.util.List;
 @Service
 public class SubscriptionMutationTransactions {
 
-    private static final Logger log = LoggerFactory.getLogger(SubscriptionMutationTransactions.class);
-
     private final SubscriptionRepository subscriptionRepository;
     private final UserRepository userRepository;
     private final PlanService planService;
     private final SubscriptionStateMachine stateMachine;
     private final ActiveMembershipLockRepository lockRepository;
+    private final PlanVersionRepository planVersionRepository;
+    private final SubscriptionIdempotencyRepository idempotencyRepository;
     private final Clock clock;
 
     public SubscriptionMutationTransactions(SubscriptionRepository subscriptionRepository,
@@ -49,48 +51,58 @@ public class SubscriptionMutationTransactions {
                                              PlanService planService,
                                              SubscriptionStateMachine stateMachine,
                                              ActiveMembershipLockRepository lockRepository,
+                                             PlanVersionRepository planVersionRepository,
+                                             SubscriptionIdempotencyRepository idempotencyRepository,
                                              Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.userRepository = userRepository;
         this.planService = planService;
         this.stateMachine = stateMachine;
         this.lockRepository = lockRepository;
+        this.planVersionRepository = planVersionRepository;
+        this.idempotencyRepository = idempotencyRepository;
         this.clock = clock;
     }
 
     /**
-     * Creates a subscription and its {@link ActiveMembershipLock} row in ONE transaction, so
-     * they commit or roll back together. Defense in depth against duplicate active
-     * subscriptions, deliberately layered:
+     * Creates a subscription using two complementary database guarantees:
      * <ol>
-     *   <li>An app-level check (below) gives a fast, friendly 409 for the common, non-racy case,
-     *       and opportunistically cleans up a stale lock row left behind by a subscription that
-     *       expired by date but was never read (so its status was never lazily flipped).</li>
-     *   <li>The DB-level unique constraint on {@code active_membership_lock.user_id} is the
-     *       actual correctness guarantee for the genuine race: if two requests for the same new
-     *       subscriber both pass step 1 simultaneously, both proceed to insert - the database
-     *       allows only one, and the other's {@code save()} throws
-     *       {@link DataIntegrityViolationException}, which is caught here and turned into a 409.
-     *       Because both writes (subscription + lock) share this one transaction, the loser's
-     *       partially-inserted subscription row rolls back too - no orphan record.</li>
+     *   <li>A {@code PESSIMISTIC_WRITE} lock on the user row serializes subscription creation
+     *       for the same user across all application servers sharing the database.</li>
+     *   <li>The unique {@link ActiveMembershipLock} row remains a database invariant: at most
+     *       one active membership can exist for a user even if another code path violates the
+     *       application-level assumption.</li>
      * </ol>
-     * <p>
-     * One deliberately-accepted gap: the opportunistic cleanup step below (flipping a
-     * stale ACTIVE-status-but-time-expired row to EXPIRED) is a plain {@code save()}, not
-     * wrapped in the same optimistic-lock retry-once pattern as {@link #changeTier} / {@link
-     * #cancel}. In the extremely narrow case of two concurrent {@code createSubscription} calls
-     * for the same user both racing to clean up the SAME stale row, one could get an
-     * {@code ObjectOptimisticLockingFailureException} here uncaught, surfacing as a 500 rather
-     * than a clean 409/retry. Not fixed for this exercise (it would mean either a third retry
-     * wrapper or folding this into the generic retry helper for a genuinely rare race on top of
-     * an already-rare race); flagged here so it isn't mistaken for an oversight.
+     * The idempotency record is written in the same transaction, so a retry against any server
+     * returns the original subscription rather than creating another one.
      */
     @Transactional
-    public Subscription createSubscription(Long userId, Long planId, Long tierId) {
-        User user = userRepository.findById(userId)
+    public Subscription createSubscription(Long userId, Long planId, Long tierId, String idempotencyKey) {
+        // Pessimistic user-row lock is database-backed and therefore coordinates requests
+        // across every application server connected to the same database.
+        User user = userRepository.findByIdForUpdate(userId)
                 .orElseThrow(() -> new NotFoundException("User not found: " + userId));
+
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            String key = idempotencyKey.trim();
+            if (key.length() > 200) {
+                throw new IllegalArgumentException("Idempotency-Key must be at most 200 characters");
+            }
+            var previous = idempotencyRepository.findByUserIdAndIdempotencyKey(userId, key);
+            if (previous.isPresent()) {
+                SubscriptionIdempotency record = previous.get();
+                if (!record.getPlanId().equals(planId) || !record.getTierId().equals(tierId)) {
+                    throw new ConflictException("Idempotency-Key was already used with different subscription parameters");
+                }
+                return record.getSubscription();
+            }
+            idempotencyKey = key;
+        }
+
         Plan plan = planService.getPlan(planId);
         Tier tier = planService.getTier(tierId);
+        PlanVersion planVersion = planVersionRepository.findTopByPlanIdOrderByVersionNumberDesc(planId)
+                .orElseThrow(() -> new NotFoundException("No price version configured for plan: " + planId));
 
         List<Subscription> activeStatusSubs = subscriptionRepository.findByUserIdAndStatus(userId, SubscriptionStatus.ACTIVE);
         Instant now = clock.instant();
@@ -99,36 +111,45 @@ public class SubscriptionMutationTransactions {
                 throw new ConflictException(
                         "User " + userId + " already has an active subscription - cancel it before subscribing again");
             }
-            // Status says ACTIVE but the end date has passed and nobody has read it yet to
-            // trigger the usual lazy-expiry correction - clean up here so this user isn't
-            // permanently blocked from subscribing again by a stale lock row.
             existing.setStatus(SubscriptionStatus.EXPIRED);
             subscriptionRepository.save(existing);
             lockRepository.deleteByUserId(userId);
         }
 
-        Subscription subscription = new Subscription(user, plan, tier, now, plan.computeEndDate(now));
+        Subscription subscription = new Subscription(user, plan, planVersion, tier, now, plan.computeEndDate(now));
         subscription = subscriptionRepository.save(subscription);
+        lockRepository.save(new ActiveMembershipLock(userId, subscription.getId()));
 
-        try {
-            lockRepository.save(new ActiveMembershipLock(userId, subscription.getId()));
-        } catch (DataIntegrityViolationException raceLost) {
-            // A concurrent request for this same user won the race between our check above and
-            // this insert. The whole transaction rolls back (subscription row included) since
-            // this exception propagates out of a @Transactional method.
-            log.warn("Concurrent duplicate-subscribe detected for user {} at the DB constraint", userId);
-            throw new ConflictException(
-                    "User " + userId + " already has an active subscription (concurrent request) - please retry");
+        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
+            idempotencyRepository.save(new SubscriptionIdempotency(
+                    userId, idempotencyKey, planId, tierId, subscription));
         }
 
         return subscription;
     }
 
+    /**
+     * Guards against a STALE-ACTIVE subscription: {@code status} can still read ACTIVE in the
+     * database even after {@code endDate} has passed, because expiry is corrected lazily on
+     * read (see {@link Subscription#isCurrentlyActive}), not by a background job that runs
+     * before every write. Without this check, a subscription that has expired but hasn't been
+     * touched by {@code getCurrentMembership} yet would pass {@code assertTierChangeAllowed}
+     * (which only inspects the persisted enum) and let a caller "change tier" on a membership
+     * that is no longer live - purely a data-consistency problem, since
+     * {@link com.firstclub.membership.web.CheckoutController} independently re-checks liveness
+     * before granting any benefit, but a real gap for GET /membership to then show a
+     * just-changed tier on a row it immediately re-flips to EXPIRED. This is the same liveness
+     * check CheckoutController already applies for the same reason - see that class's comment.
+     */
     @Transactional
     public Subscription changeTier(Long subscriptionId, Long newTierId) {
         Subscription subscription = subscriptionRepository.findById(subscriptionId)
                 .orElseThrow(() -> new NotFoundException("Subscription not found: " + subscriptionId));
         stateMachine.assertTierChangeAllowed(subscription.getStatus());
+        if (!subscription.isCurrentlyActive(clock.instant())) {
+            throw new InvalidTransitionException(
+                    "Cannot change tier on subscription " + subscriptionId + " - it has expired");
+        }
         Tier newTier = planService.getTier(newTierId);
 
         subscription.setTier(newTier);

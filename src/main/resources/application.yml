@@ -35,6 +35,9 @@ membership:
   reconciliation:
     fixed-delay-ms: 3600000
     initial-delay-ms: 60000
+    # Active users re-evaluated per page per sweep, so the job's memory footprint stays
+    # bounded regardless of how large the active membership base grows.
+    batch-size: 200
   admin:
     # Closed by default. Supply MEMBERSHIP_ADMIN_API_KEY in the deployment environment to enable.
     api-key: ${MEMBERSHIP_ADMIN_API_KEY:}

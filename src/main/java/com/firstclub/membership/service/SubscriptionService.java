@@ -2,16 +2,20 @@ package com.firstclub.membership.service;
 
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
+import com.firstclub.membership.domain.SubscriptionIdempotency;
 import com.firstclub.membership.exception.ConflictException;
 import com.firstclub.membership.exception.NotFoundException;
 import com.firstclub.membership.repository.SubscriptionRepository;
+import com.firstclub.membership.repository.SubscriptionIdempotencyRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.util.Optional;
 
 /**
  * User-initiated subscription lifecycle: subscribe, upgrade/downgrade tier, cancel, and status
@@ -22,10 +26,10 @@ import java.time.Clock;
  * <p>
  * Optimistic-lock retry is standardized across every mutation that touches an existing
  * {@code @Version}-controlled row (changeTier, cancel): one retry through a fresh transaction on
- * {@link ObjectOptimisticLockingFailureException}, then a 409 to the caller. {@code subscribe}
- * does not need this pattern - a duplicate-active-subscription conflict there is a genuine,
- * real conflict rather than a transient lock collision, so it is surfaced immediately rather
- * than retried (see {@link SubscriptionMutationTransactions#createSubscription}).
+ * {@link ObjectOptimisticLockingFailureException}, then a 409 to the caller. Subscription
+ * creation has a separate integrity-race recovery: if the database unique constraint is won by a
+ * concurrent request using the same idempotency key, the failed transaction is discarded and the
+ * committed subscription is replayed from a fresh repository transaction.
  */
 @Service
 public class SubscriptionService {
@@ -35,16 +39,42 @@ public class SubscriptionService {
     private final SubscriptionRepository subscriptionRepository;
     private final SubscriptionMutationTransactions mutations;
     private final Clock clock;
+    private final SubscriptionIdempotencyRepository idempotencyRepository;
 
     public SubscriptionService(SubscriptionRepository subscriptionRepository,
-                                SubscriptionMutationTransactions mutations, Clock clock) {
+                                SubscriptionMutationTransactions mutations, Clock clock,
+                                SubscriptionIdempotencyRepository idempotencyRepository) {
         this.subscriptionRepository = subscriptionRepository;
         this.mutations = mutations;
         this.clock = clock;
+        this.idempotencyRepository = idempotencyRepository;
     }
 
-    public Subscription subscribe(Long userId, Long planId, Long tierId) {
-        return mutations.createSubscription(userId, planId, tierId);
+    public Subscription subscribe(Long userId, Long planId, Long tierId, String idempotencyKey) {
+        String key = idempotencyKey == null ? null : idempotencyKey.trim();
+        try {
+            return mutations.createSubscription(userId, planId, tierId, key);
+        } catch (DataIntegrityViolationException constraintRace) {
+            // A concurrent request can win the unique (user_id, idempotency_key) constraint
+            // after both requests initially observe "no record". The failed transaction must
+            // be discarded; replay is deliberately performed through a fresh transaction.
+            if (key == null || key.isBlank()) {
+                throw constraintRace;
+            }
+            Optional<SubscriptionIdempotency> existing = idempotencyRepository
+                    .findByUserIdAndIdempotencyKey(userId, key);
+            if (existing.isPresent()) {
+                SubscriptionIdempotency record = existing.get();
+                if (!record.getPlanId().equals(planId) || !record.getTierId().equals(tierId)) {
+                    throw new ConflictException(
+                            "Idempotency-Key was already used with different subscription parameters");
+                }
+                return record.getSubscription();
+            }
+            // No idempotency record means this was some other integrity race (for example,
+            // an active-membership guard). Do not convert that unrelated conflict into a replay.
+            throw constraintRace;
+        }
     }
 
     public Subscription changeTier(Long subscriptionId, Long newTierId) {

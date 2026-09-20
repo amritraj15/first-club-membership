@@ -2,20 +2,24 @@
 
 A tiered membership backend: Plans (Monthly/Quarterly/Yearly) + Tiers (Silver/Gold/Platinum),
 configurable benefits, order-driven plus scheduled tier reconciliation, exclusive deals, and a
-checkout-integration endpoint. Spring Boot 3 / Java 17, H2 in-memory database, no external
-services required.
+checkout-integration endpoint. Spring Boot 3 / Java 17, H2 for tests/local development, PostgreSQL
+support for shared multi-server deployments, no external services required.
 
 ## Verification status
 
-Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn test` suite passes:
+Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn clean install` lifecycle passes:
 
 ```text
-Tests run: 23, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 27, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
 ```
 
 This includes fast unit tests and Spring Boot integration tests that start an embedded Tomcat
-server, exercise the REST API over HTTP, and verify concurrent subscription creation is safely
-limited to one active membership per user.
+server, exercise the REST API over HTTP, and verify concurrent subscription creation, idempotency,
+and price-versioning behaviour.
+
+The successful Maven lifecycle also compiles the application, packages the Spring Boot JAR, and
+installs the artifact into the local Maven repository.
 
 ## How to build and run
 
@@ -31,6 +35,9 @@ active-membership scenarios, and exposes an H2 console at `/h2-console`
 (JDBC URL `jdbc:h2:mem:membershipdb`, user `sa`, empty password) if you want to inspect the
 schema directly.
 
+For a shared multi-server setup, PostgreSQL configuration is also provided through
+`application-postgres.yml` and `docker-compose.yml`.
+
 Run the tests:
 
 ```bash
@@ -41,10 +48,8 @@ This runs both kinds of test in the suite:
 - **Unit tests** (`strategy/TierEvaluatorTest`, `service/SubscriptionStateMachineTest`,
   `service/QualificationWindowResolverTest`) - plain JUnit 5, no Spring context, fast.
 - **Integration tests** (`web/MembershipApiIntegrationTest`) - `@SpringBootTest` with a real
-  embedded server and `TestRestTemplate`, exercising the actual REST API end-to-end, including a
-  genuine concurrent-request test for the duplicate-subscription fix. These start a real Spring
-  context and embedded Tomcat, so they're slower than the unit tests - expect the full `mvn test`
-  run to take noticeably longer than just the unit tests would.
+  embedded server and `TestRestTemplate`, exercising the actual REST API end-to-end, including
+  concurrent subscription creation, same-key idempotency, and plan-price versioning.
 
 ## Design summary
 
@@ -71,8 +76,8 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   far more readable in a 20-minute code review.
 - **Concurrency**: optimistic locking (`@Version` on `Subscription`) with a retry-once policy on
   conflict, then a 409 to the caller, standardized across every mutation that touches an existing
-  row (`changeTier`, `cancel`). The retry is deliberately implemented via a **separate Spring
-  bean per transactional unit of work** (`TierReevaluationTransaction`,
+  row (`changeTier`, `cancel`). The retry is deliberately implemented via a **separate Spring bean per
+  transactional unit of work** (`TierReevaluationTransaction`,
   `SubscriptionMutationTransactions`) rather than a same-class method, because Spring's
   `@Transactional` is implemented via an AOP proxy that a same-class ("self-invocation") call
   bypasses entirely - a same-class retry would silently run with no transaction boundary at all,
@@ -84,9 +89,16 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   atomically alongside the `Subscription` in one transaction). An app-level check alone
   ("query for an active subscription, then insert if none") has a race: two concurrent requests
   can both pass the check before either commits. See `SubscriptionMutationTransactions.createSubscription`
-  Javadoc for the full layered defense (app-level fast-path + DB constraint), and
-  `MembershipApiIntegrationTest.concurrentSubscribeAttempts_onlyOneSucceeds` for a test that
-  actually fires 8 concurrent HTTP requests at it and asserts exactly one wins.
+  Javadoc for the full layered defense: user-row `PESSIMISTIC_WRITE` locking during subscription
+  creation, an application-level fast path, and the database uniqueness invariant. The
+  `MembershipApiIntegrationTest.concurrentSubscribeAttempts_onlyOneSucceeds` test fires 8
+  concurrent HTTP requests and asserts exactly one active membership is created.
+- **Idempotency is persisted and database-backed**, not an in-memory request cache. `POST
+  /api/subscriptions` accepts `Idempotency-Key`; the key is associated with the user/request
+  parameters and resulting subscription so a retry returns the original subscription. Reusing
+  the same key with different request parameters returns 409. The concurrent same-key integration
+  test verifies that concurrent identical requests produce one subscription and deterministic
+  replay rather than duplicate membership creation.
 - **Discount stacking is policy-driven, not accumulated ad-hoc** (`DiscountPolicy` interface,
   `CategoryOverridesGlobalDiscountPolicy` implementation). A tier with both an ALL-scope and a
   category-scope `PERCENTAGE_DISCOUNT` benefit resolves to exactly ONE rate per cart item
@@ -109,6 +121,10 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Expiry is computed lazily on read** (`Subscription.isCurrentlyActive`), not solely by a
   background job - a missed cron run can never make an expired subscription look active, and
   `GET /users/{id}/membership` self-corrects the persisted status on read.
+- **Plan pricing is immutable at the subscription level** through `PlanVersion`. The current
+  `Plan` price represents the latest catalog version; a subscription stores the exact version
+  purchased. Admin price changes create a new version rather than mutating a historical version,
+  so existing subscriptions are grandfathered at their purchased price.
 
 ## Ambiguities resolved (and how)
 
@@ -138,52 +154,46 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
    runtime through a small, API-key-protected admin surface. Tier topology and qualification
    criteria remain code/seed managed, because changing them is a material policy decision.
 9. **Discount stacking** - see the design summary above and `CategoryOverridesGlobalDiscountPolicy`.
+10. **What happens when the same idempotency key is reused?** The same key with the same
+    subscription request is treated as a retry and returns the original subscription. The same
+    key with different user/plan/tier parameters returns 409 to prevent accidental reuse.
+11. **What happens when plan pricing changes?** The current catalog price changes by creating a
+    new immutable `PlanVersion`; existing subscriptions retain their original purchased version.
 
 ## What was deliberately NOT implemented (and why)
 
 - **Full event/outbox pipeline for tier reconciliation** - this build has immediate order
-  triggers, a manual reconciliation endpoint, and an hourly in-process scheduled safety net;
-  it intentionally does not introduce a message broker, durable outbox, or distributed job
-  coordination. A multi-instance production deployment should add one of those mechanisms.
+  triggers, a manual reconciliation endpoint, and an hourly in-process scheduled safety net.
+  It intentionally does not introduce a message broker, durable outbox, or distributed job
+  coordinator. For a multi-instance production deployment, the scheduler should be replaced or
+  coordinated through a durable/distributed mechanism.
 - **Full GoF State pattern classes** for subscription lifecycle - an enum + transition-guard map
-  is equally correct and easier to review.
-- **Distributed/keyed locking infrastructure** - a single `@Version` column with retry-once
-  covers "bonus for concurrency" without solving a scale problem this exercise doesn't have.
-  (Duplicate-subscription prevention specifically DOES get a DB-level fix - `ActiveMembershipLock`
-  - because that one is a real, demonstrated race, not a hypothetical scale concern.)
-- **Event-sourced subscription history** - `Subscription` is a mutable row, not an append-only
-  log. Worth doing at real scale for audit purposes; not worth the machinery here. (A lighter
-  version of this - storing WHY a tier changed, e.g. "GOLD -> PLATINUM, reason: ORDER_VALUE,
-  actual ₹85,000, required ₹75,000" - was also considered and deferred for the same reason.)
-- **Price versioning / grandfathering** - if a plan's price changes, this system does not
-  preserve the price an already-subscribed user is paying. Flagged here explicitly as a real
-  gap rather than silently omitted - a production system needs this.
-- **Full order/catalog subsystem** - `OrderRecord` is a minimal stand-in (just value + timestamp)
+  is equally correct and easier to review for the three-state lifecycle used here.
+- **Distributed/keyed application locks** - the implementation now uses a database-backed
+  `PESSIMISTIC_WRITE` lock on the user row during subscription creation, so concurrent requests
+  hitting different application servers but sharing the same database are serialized for that
+  user. The `ActiveMembershipLock` unique constraint remains a second database invariant.
+  Redis/ZooKeeper-style distributed locks are still unnecessary for this exercise.
+- **Event-sourced subscription history** - `Subscription` remains a mutable current-state row,
+  not an append-only event log. Full event sourcing and a detailed tier-change audit trail are
+  production extensions, not required for the exercise.
+- **Price versioning is NOT omitted anymore** - plan prices are now immutable `PlanVersion`
+  records. A subscription stores the exact purchased price version, so existing subscriptions
+  are grandfathered when an admin changes the current plan price. `PATCH /api/admin/plans/{id}/price`
+  creates a new version; it never mutates an existing version.
+- **Full order/catalog subsystem** - `OrderRecord` remains a minimal stand-in (value + timestamp)
   purely as the input signal for tier evaluation, since a real order/catalog system is out of
   scope for this exercise.
-- **Broad configuration API** (`POST /api/admin/tiers`, criteria editing, plan pricing, deletion)
-  - intentionally not included. The implemented admin surface is limited to tier benefits and
-  evicts `"tiers"` / `"tiersDesc"` after each write.
-- **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and
-  returns these as entitlements (`checkout/benefits` reports whether they apply), but does not
-  implement the systems that would actually consume them (a sales service gating early access,
-  a support-routing system prioritizing tickets). Keeping the membership service's job as
-  "define and expose the entitlement" rather than reaching into unrelated systems keeps it
-  modular - the boundary is deliberate, not an oversight.
-- **Idempotency keys for `POST /api/subscriptions`** - a real production concern (a client
-  retrying after a network timeout could otherwise create a second subscription), but the
-  DB-level `ActiveMembershipLock` constraint already prevents the specific bad outcome
-  (two ACTIVE subscriptions for one user) even without an idempotency key; a key would mainly
-  buy a cleaner error/replay experience for the retrying client, which is a real but lower-value
-  improvement than the two Priority-1 fixes above.
+- **Broad configuration API** - runtime administration is intentionally limited to tier benefits
+  and plan pricing. Tier topology and qualification criteria remain controlled policy/seed data.
+- **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and exposes
+  entitlements; it does not reach into a sales system or support-routing system to enforce them.
+  Those downstream systems should consume the entitlement through their own service boundaries.
 - **Full authorization boundaries / admin-vs-user API separation** - user-facing endpoints still
-  have no identity layer. The mutating admin-benefit routes are the exception: they are closed by
-  default and require `X-Admin-Api-Key` matching `MEMBERSHIP_ADMIN_API_KEY`. Replace this small
-  guard with the deployment's normal role-based identity system in production.
-- **Observability (metrics/structured audit logs)** - `TierReevaluationTransaction` and the
-  mutation transactions log promotions, demotions, and conflicts via SLF4J, but there's no
-  metrics emission (`tier_promotion_count`, etc.) or structured audit fields beyond what's in
-  the log messages already. Reasonable for a take-home; a real gap for production.
+  do not have an identity layer. Admin mutation routes are protected by `X-Admin-Api-Key` for the
+  exercise. Production should replace that guard with the platform's normal identity/RBAC model.
+- **Full production observability** - promotions, demotions, conflicts, and reconciliation events
+  are logged through SLF4J, but the service does not add a metrics/trace/audit platform.
 
 ## Suggestions reviewed (from the implementation-review pass)
 
@@ -192,14 +202,14 @@ disposition of each - what got fixed, what got documented instead of built, and 
 
 | # | Suggestion | Disposition |
 |---|---|---|
-| 1 | DB-level duplicate-active-subscription protection | **Fixed.** `ActiveMembershipLock` + unique constraint; see design summary and `SubscriptionMutationTransactions`. Covered by a genuine concurrent-request integration test. |
+| 1 | DB-level duplicate-active-subscription protection | **Fixed.** `ActiveMembershipLock` + unique constraint plus database user-row locking; covered by concurrent-request integration tests. |
 | 2 | Clarify month vs rolling-30-days semantics | **Fixed.** Calendar month is the default and rolling days is an explicit per-criterion opt-in. |
 | 3 | Discount stacking/precedence policy | **Fixed.** `DiscountPolicy` / `CategoryOverridesGlobalDiscountPolicy`; the double-counting bug is now structurally impossible (one rate resolved per cart item). |
-| 4 | REST integration tests | **Added.** `MembershipApiIntegrationTest` - happy paths, 409/422/404 failure cases, and the concurrency test. |
+| 4 | REST integration tests | **Added.** `MembershipApiIntegrationTest` - happy paths, 409/422/404 failure cases, and concurrency/idempotency tests. |
 | 5 | Admin config APIs vs. "configurable" clarification | **Implemented narrowly.** Protected runtime CRUD for benefit rows only; no broad tier/criteria CRUD. |
 | 6 | Standardize optimistic-lock retry across mutations | **Fixed.** `cancel` now goes through the same retry-once pattern as `changeTier`, via `SubscriptionService.withOptimisticRetry`. |
 | 7 | Calendar-based duration (`plusMonths`/`plusYears`) | **Fixed.** `Plan.computeEndDate` replaces the fixed 30/90/360-day approximation. |
-| 8 | Durable tier reconciliation (outbox/event pipeline) | **Partially addressed.** Immediate order triggers plus the configured scheduled sweep; no durable outbox pipeline. |
+| 8 | Durable tier reconciliation (outbox/event pipeline) | **Partially addressed.** Immediate order triggers + manual reconciliation + hourly in-process sweep. Durable outbox/distributed scheduling remains production scope. |
 | 9 | Explicitly define demotion policy | **Documented.** Promotion + automatic demotion, both driven by evaluation triggers - see ambiguity #7 and `TierReevaluationTransaction` Javadoc. |
 | 10 | Benefit definition vs. enforcement | **Documented** - see "deliberately not implemented" above; this service defines/exposes entitlements, doesn't enforce them downstream. |
 | 11 | Separate `Subscription` from a `TierQualification` entity | **Not done.** Would help audit/debug at real scale; adds a second entity and a sync concern for a take-home. |
@@ -207,13 +217,68 @@ disposition of each - what got fixed, what got documented instead of built, and 
 | 13 | Composable AND/OR tier criteria | **Already implemented** before this review - `Tier.criteriaMatchMode` (`ANY`/`OR`). |
 | 14 | Explicit tier rank instead of enum ordering | **Already implemented** before this review - `Tier.rank`, used by `TierEvaluator` via `Comparator.comparingInt(Tier::getRank)`. |
 | 15 | Richer benefit definition (priority, stackable flag, JSON config blob) | **Not done** - the current `type + paramValue + scope` shape covers everything the spec asks for; a generic config blob would trade compile-time safety for flexibility this exercise doesn't need yet. |
-| 16 | Idempotency keys for subscribe | **Not done** - see "deliberately not implemented" above; the DB constraint already prevents the dangerous outcome. |
+| 16 | Idempotency keys for subscribe | **Fixed.** `Idempotency-Key` is persisted per user and replayed safely; a reused key with different parameters returns 409. User-row locking makes the operation safe across application servers sharing the same database. |
 | 17 | HTTP status code mapping (409/422/etc.) | **Fixed** the one real gap: `InvalidTransitionException` now returns 422, not 400. Cancel intentionally still returns 200 + body (not 204) - showing the resulting `CANCELLED` state is more useful for a demo than an empty response, a deliberate choice, not an oversight. |
 | 18 | Authorization boundaries | **Partially addressed.** Admin benefit mutation is API-key protected; a full user/admin identity model remains out of scope. |
-| 19 | Pricing/benefit versioning & effective dates | **Not done** - same territory as the pre-existing "price versioning/grandfathering" gap already documented. |
+| 19 | Pricing/benefit versioning & effective dates | **Fixed for plan pricing.** Immutable `PlanVersion` is captured by each subscription; admin price changes create a new version and existing subscriptions retain the old price. |
 | 20 | Observability (metrics, structured logs) | **Not done** beyond existing SLF4J logging - noted as a real gap. |
 
+## Concurrency, idempotency, and price-version guarantees
 
+### Multi-server concurrency
+
+`POST /api/subscriptions` locks the target user row with `PESSIMISTIC_WRITE` inside the
+subscription transaction. Because the lock is held by the shared database, two application
+servers cannot simultaneously create memberships for the same user. The `ActiveMembershipLock`
+unique constraint remains the database-level invariant that guarantees at most one active
+membership.
+
+```text
+App Server A ----\
+                 +--> Shared PostgreSQL --> PESSIMISTIC_WRITE user lock
+App Server B ----/                         + ActiveMembershipLock unique(user_id)
+```
+
+### Idempotency
+
+`POST /api/subscriptions` accepts an optional `Idempotency-Key` header. The key is persisted
+with the user, plan, tier, and resulting subscription in the same transaction. Retrying the same
+logical request returns the original subscription; reusing the key with different plan/tier/user
+parameters returns `409 Conflict`.
+
+Example:
+
+```bash
+curl -s -X POST localhost:8080/api/subscriptions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: subscribe-user-42-001" \
+  -d '{"userId":42,"planId":1,"tierId":1}' | jq
+```
+
+### Price versioning / grandfathering
+
+Every plan starts with version 1. A price change creates version 2, version 3, etc. A
+subscription stores the exact `PlanVersion` it purchased, so an existing subscriber keeps the
+old price while new subscribers use the latest version.
+
+The protected admin API is:
+
+```text
+PATCH /api/admin/plans/{planId}/price
+X-Admin-Api-Key: <configured admin key>
+```
+
+Example:
+
+```bash
+curl -s -X PATCH localhost:8080/api/admin/plans/1/price \
+  -H "X-Admin-Api-Key: $MEMBERSHIP_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"price":249.00,"currency":"INR"}' | jq
+```
+
+The response contains the newly-created price version. Existing subscriptions continue to
+reference their previous version.
 
 ## API walkthrough (curl)
 
@@ -272,9 +337,9 @@ curl -s -X POST localhost:8080/api/subscriptions \
   -H "Content-Type: application/json" -d '{"userId": 2, "planId": 1, "tierId": 3}' | jq
 curl -s localhost:8080/api/users/2/membership | jq
 
-# 10. Discount stacking policy (bug #3 from the review, now fixed) - user 2 is on PLATINUM,
-#     which has BOTH "10% off ALL" and "15% off Electronics". The two must NOT stack: Electronics
-#     gets 15% (not 25%), Groceries falls back to the 10% ALL rate.
+# 10. Discount stacking policy - user 2 is on PLATINUM,
+#     which has BOTH "10% off ALL" and "15% off Electronics". The two must NOT stack:
+#     Electronics gets 15%, Groceries falls back to the 10% ALL rate.
 curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
   -H "Content-Type: application/json" \
   -d '{"items": [{"category": "Electronics", "price": 1000}, {"category": "Groceries", "price": 500}]}' | jq
@@ -291,8 +356,8 @@ curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
   -d '{"items": [{"category": "Beauty", "price": 1000}]}' | jq
 # expect totalDiscount = 200.00
 
-# 12. Concurrent duplicate-subscribe protection (bug #1 from the review) - fire two subscribe
-#     requests for the SAME new user at once; exactly one should return 201, the other 409.
+# 12. Concurrent duplicate-subscribe protection - fire two subscribe requests for the SAME
+#     new user at once; exactly one should return 201, the other 409.
 curl -s -X POST localhost:8080/api/users \
   -H "Content-Type: application/json" \
   -d '{"name": "Race Test", "email": "race@example.com"}' | jq
@@ -304,6 +369,24 @@ curl -s -X POST localhost:8080/api/subscriptions -H "Content-Type: application/j
 wait
 # The automated version of this exact scenario, with 8 concurrent requests instead of 2, is
 # MembershipApiIntegrationTest.concurrentSubscribeAttempts_onlyOneSucceeds.
+
+# 13. Same-key idempotency - retry the exact same subscription request with the same key.
+curl -s -X POST localhost:8080/api/subscriptions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: subscribe-user-42-002" \
+  -d '{"userId":42, "planId":1, "tierId":1}' | jq
+curl -s -X POST localhost:8080/api/subscriptions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: subscribe-user-42-002" \
+  -d '{"userId":42, "planId":1, "tierId":1}' | jq
+# The second request replays the original subscription instead of creating another one.
+
+# 14. Plan price versioning - update the current catalog price through the protected admin API.
+curl -s -X PATCH localhost:8080/api/admin/plans/1/price \
+  -H "X-Admin-Api-Key: $MEMBERSHIP_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"price":249.00,"currency":"INR"}' | jq
+# Existing subscriptions retain their purchased PlanVersion; new subscriptions use the new version.
 ```
 
 ### Runtime benefit administration
@@ -335,3 +418,5 @@ curl -s -X POST localhost:8080/api/admin/tiers/3/benefits \
   `TierReevaluationTransaction` and `TierReconciliationScheduler`. It performs at most one
   repository query per distinct requested window in an evaluation; if window/cardinality grows
   materially, aggregate queries or precomputed qualification snapshots are the next step.
+- For multi-server deployment, PostgreSQL is the shared consistency boundary for user-row locks,
+  active-membership uniqueness, idempotency, and plan-version creation.

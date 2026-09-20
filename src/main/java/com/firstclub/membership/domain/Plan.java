@@ -7,6 +7,10 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.CascadeType;
+import java.util.ArrayList;
+import java.util.List;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -15,9 +19,9 @@ import java.time.ZonedDateTime;
 
 /**
  * A billing plan. Price is deliberately BigDecimal, never float/double, to avoid the classic
- * rounding-error bug class in subscription billing. Price CHANGES are out of scope for this
- * exercise (see README "deliberately not implemented") - there is no versioning/grandfathering
- * of price for already-active subscriptions here.
+ * rounding-error bug class in subscription billing. The current price/currency represent the
+ * latest catalog version; existing subscriptions reference an immutable PlanVersion so they
+ * retain their grandfathered commercial terms.
  */
 @Entity
 @Table(name = "plan")
@@ -33,6 +37,9 @@ public class Plan {
     private BigDecimal price;
 
     private String currency;
+
+    @OneToMany(mappedBy = "plan", cascade = CascadeType.ALL, orphanRemoval = false)
+    private List<PlanVersion> versions = new ArrayList<>();
 
     protected Plan() {
         // JPA
@@ -58,6 +65,15 @@ public class Plan {
 
     public String getCurrency() {
         return currency;
+    }
+
+    public void updateCurrentPrice(BigDecimal price, String currency) {
+        this.price = price;
+        this.currency = currency;
+    }
+
+    public void addVersion(PlanVersion version) {
+        versions.add(version);
     }
 
     /**

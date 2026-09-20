@@ -7,6 +7,7 @@ import com.firstclub.membership.domain.CriteriaType;
 import com.firstclub.membership.domain.CriteriaWindowType;
 import com.firstclub.membership.domain.OrderRecord;
 import com.firstclub.membership.domain.Plan;
+import com.firstclub.membership.domain.PlanVersion;
 import com.firstclub.membership.domain.PlanType;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.Tier;
@@ -17,6 +18,7 @@ import com.firstclub.membership.domain.User;
 import com.firstclub.membership.repository.ActiveMembershipLockRepository;
 import com.firstclub.membership.repository.OrderRecordRepository;
 import com.firstclub.membership.repository.PlanRepository;
+import com.firstclub.membership.repository.PlanVersionRepository;
 import com.firstclub.membership.repository.SubscriptionRepository;
 import com.firstclub.membership.repository.TierRepository;
 import com.firstclub.membership.repository.UserRepository;
@@ -46,12 +48,14 @@ public class DataSeeder implements CommandLineRunner {
     private final OrderRecordRepository orderRecordRepository;
     private final SubscriptionRepository subscriptionRepository;
     private final ActiveMembershipLockRepository activeMembershipLockRepository;
+    private final PlanVersionRepository planVersionRepository;
     private final TierEvaluationService tierEvaluationService;
     private final Clock clock;
 
     public DataSeeder(PlanRepository planRepository, TierRepository tierRepository, UserRepository userRepository,
                       OrderRecordRepository orderRecordRepository, SubscriptionRepository subscriptionRepository,
                       ActiveMembershipLockRepository activeMembershipLockRepository,
+                      PlanVersionRepository planVersionRepository,
                       TierEvaluationService tierEvaluationService, Clock clock) {
         this.planRepository = planRepository;
         this.tierRepository = tierRepository;
@@ -59,6 +63,7 @@ public class DataSeeder implements CommandLineRunner {
         this.orderRecordRepository = orderRecordRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.activeMembershipLockRepository = activeMembershipLockRepository;
+        this.planVersionRepository = planVersionRepository;
         this.tierEvaluationService = tierEvaluationService;
         this.clock = clock;
     }
@@ -69,9 +74,12 @@ public class DataSeeder implements CommandLineRunner {
             return; // Already seeded (e.g. re-run without a fresh in-memory DB).
         }
 
-        planRepository.save(new Plan(PlanType.MONTHLY, new BigDecimal("199.00"), "INR"));
-        planRepository.save(new Plan(PlanType.QUARTERLY, new BigDecimal("499.00"), "INR"));
+        Plan monthly = planRepository.save(new Plan(PlanType.MONTHLY, new BigDecimal("199.00"), "INR"));
+        Plan quarterly = planRepository.save(new Plan(PlanType.QUARTERLY, new BigDecimal("499.00"), "INR"));
         Plan yearly = planRepository.save(new Plan(PlanType.YEARLY, new BigDecimal("1499.00"), "INR"));
+        planVersionRepository.save(new PlanVersion(monthly, 1, monthly.getPrice(), monthly.getCurrency()));
+        planVersionRepository.save(new PlanVersion(quarterly, 1, quarterly.getPrice(), quarterly.getCurrency()));
+        planVersionRepository.save(new PlanVersion(yearly, 1, yearly.getPrice(), yearly.getCurrency()));
 
         Tier silver = new Tier(TierName.SILVER, 1, CriteriaMatchMode.ANY);
         // Silver has NO criteria -> everyone qualifies; it is the base tier.
@@ -140,7 +148,7 @@ public class DataSeeder implements CommandLineRunner {
 
     private void createActiveSubscription(User user, Plan plan, Tier initialTier, Instant start) {
         Subscription subscription = subscriptionRepository.save(
-                new Subscription(user, plan, initialTier, start, plan.computeEndDate(start)));
+                new Subscription(user, plan, planVersionRepository.findTopByPlanIdOrderByVersionNumberDesc(plan.getId()).orElseThrow(), initialTier, start, plan.computeEndDate(start)));
         activeMembershipLockRepository.save(new ActiveMembershipLock(user.getId(), subscription.getId()));
     }
 }
