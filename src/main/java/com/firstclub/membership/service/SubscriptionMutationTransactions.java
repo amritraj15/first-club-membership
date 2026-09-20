@@ -7,6 +7,7 @@ import com.firstclub.membership.domain.SubscriptionIdempotency;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
 import com.firstclub.membership.domain.Tier;
+import com.firstclub.membership.domain.TierChangeAudit;
 import com.firstclub.membership.domain.TierSource;
 import com.firstclub.membership.domain.User;
 import com.firstclub.membership.exception.ConflictException;
@@ -16,6 +17,7 @@ import com.firstclub.membership.repository.ActiveMembershipLockRepository;
 import com.firstclub.membership.repository.SubscriptionRepository;
 import com.firstclub.membership.repository.PlanVersionRepository;
 import com.firstclub.membership.repository.SubscriptionIdempotencyRepository;
+import com.firstclub.membership.repository.TierChangeAuditRepository;
 import com.firstclub.membership.repository.UserRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -44,6 +46,7 @@ public class SubscriptionMutationTransactions {
     private final ActiveMembershipLockRepository lockRepository;
     private final PlanVersionRepository planVersionRepository;
     private final SubscriptionIdempotencyRepository idempotencyRepository;
+    private final TierChangeAuditRepository tierChangeAuditRepository;
     private final CallerIdentityGuard callerIdentityGuard;
     private final Clock clock;
 
@@ -54,6 +57,7 @@ public class SubscriptionMutationTransactions {
                                              ActiveMembershipLockRepository lockRepository,
                                              PlanVersionRepository planVersionRepository,
                                              SubscriptionIdempotencyRepository idempotencyRepository,
+                                             TierChangeAuditRepository tierChangeAuditRepository,
                                              CallerIdentityGuard callerIdentityGuard,
                                              Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
@@ -63,6 +67,7 @@ public class SubscriptionMutationTransactions {
         this.lockRepository = lockRepository;
         this.planVersionRepository = planVersionRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.tierChangeAuditRepository = tierChangeAuditRepository;
         this.callerIdentityGuard = callerIdentityGuard;
         this.clock = clock;
     }
@@ -122,6 +127,8 @@ public class SubscriptionMutationTransactions {
         Subscription subscription = new Subscription(user, plan, planVersion, tier, now, plan.computeEndDate(now));
         subscription = subscriptionRepository.save(subscription);
         lockRepository.save(new ActiveMembershipLock(userId, subscription.getId()));
+        tierChangeAuditRepository.save(new TierChangeAudit(
+                userId, subscription.getId(), null, tier.getId(), subscription.getTierSource(), now));
 
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
             idempotencyRepository.save(new SubscriptionIdempotency(
@@ -155,11 +162,16 @@ public class SubscriptionMutationTransactions {
                     "Cannot change tier on subscription " + subscriptionId + " - it has expired");
         }
         Tier newTier = planService.getTier(newTierId);
+        Long previousTierId = subscription.getTier().getId();
 
         subscription.setTier(newTier);
         subscription.setTierSource(TierSource.USER_SELECTED);
         subscription.setManualTierOverride(true);
-        return subscriptionRepository.save(subscription);
+        subscription = subscriptionRepository.save(subscription);
+        tierChangeAuditRepository.save(new TierChangeAudit(
+                subscription.getUser().getId(), subscription.getId(), previousTierId, newTierId,
+                TierSource.USER_SELECTED, clock.instant()));
+        return subscription;
     }
 
     /**

@@ -10,7 +10,7 @@ support for shared multi-server deployments, no external services required.
 Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn clean install` lifecycle passes:
 
 ```text
-Tests run: 31, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 32, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
@@ -55,8 +55,8 @@ This runs all three kinds of test in the suite:
 - **Integration tests** (`web/MembershipApiIntegrationTest`) - `@SpringBootTest` with a real
   embedded server and `TestRestTemplate`, exercising the actual REST API end-to-end, including
   concurrent subscription creation, same-key idempotency, plan-price versioning, and
-  `CallerIdentityGuard` rejecting both a missing caller header and a caller acting on another
-  user's subscription/order.
+  `CallerIdentityGuard` rejecting a missing caller header, a caller mutating another user's
+  subscription/order, and a caller reading another user's membership/history/deals/checkout.
 
 ## Design summary
 
@@ -78,6 +78,19 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   protected, limited runtime API can add or update only these rows and evicts the tier caches.
   It supports normal percentage discounts, category-scoped `EXCLUSIVE_DEAL`s, and entitlements
   such as `EARLY_ACCESS = 7 DAYS`; new tiers/criteria remain controlled policy changes.
+  `BenefitType.EXPEDITED_DELIVERY` (paramValue = guaranteed delivery days) is a distinct perk
+  from the binary `FREE_DELIVERY` flag - the spec's own example list names delivery speed
+  specifically, which "free or not" alone doesn't model. Seeded on Platinum as "1 day". Adding
+  it required touching `BenefitService`'s checkout switch: that switch has no `default` arm on
+  purpose, so the compiler itself forces every new `BenefitType` to be handled at checkout,
+  rather than silently no-op-ing until someone notices in production.
+- **Tier changes are recorded in an append-only audit trail** (`TierChangeAudit`), written in
+  the same transaction as the mutation it describes - the initial tier at subscribe time, every
+  manual `changeTier`, and every automatic promotion/demotion from `TierReevaluationTransaction`.
+  This is deliberately NOT full event sourcing (see "deliberately NOT implemented" below) -
+  `Subscription`'s current state is still a normal mutable row, not something derived by
+  replaying these events - but it answers "why is this user on Gold, and when did that happen"
+  from a query instead of a log grep. Exposed read-only at `GET /users/{userId}/tier-history`.
 - **Subscription lifecycle is an enum + an allowed-transitions map** (`SubscriptionStateMachine`),
   not a full GoF State pattern. For 3 states with simple rules, the map is exactly as correct and
   far more readable in a 20-minute code review.
@@ -132,18 +145,22 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   `Plan` price represents the latest catalog version; a subscription stores the exact version
   purchased. Admin price changes create a new version rather than mutating a historical version,
   so existing subscriptions are grandfathered at their purchased price.
-- **Every mutating user-scoped endpoint requires and verifies a caller identity**
-  (`CallerIdentityGuard`). Subscribe, change tier, cancel, place/cancel an order, and reconcile
-  tier all require an `X-User-Id` header, checked against the resource's actual owner before any
-  mutation runs - `changeTier`/`cancel` check ownership immediately after loading the
-  subscription, before the state-machine check, so a non-owner can't infer a stranger's
-  subscription lifecycle state as a side effect of a rejected request. This is explicitly NOT
-  authentication - the header is self-asserted, not checked against a password/token/session -
-  so it stops accidental or casual cross-user calls, not a determined attacker who sets an
-  arbitrary header; see `CallerIdentityGuard`'s Javadoc for the exact scope boundary (read
-  endpoints are deliberately not covered) and what a production identity layer would replace.
-  Covered by `MembershipApiIntegrationTest.crossUserSubscriptionMutationIsRejectedWith403` and
-  `.missingCallerHeaderIsRejectedWith403`.
+- **Every endpoint that returns or acts on a specific user's data requires and verifies a
+  caller identity** (`CallerIdentityGuard`). This started covering only mutations - subscribe,
+  change tier, cancel, place/cancel an order, reconcile tier - and now covers the corresponding
+  reads too: `GET /membership`, `GET /tier-history`, `GET /exclusive-deals`, and `POST
+  /checkout/benefits`. Every check is against the resource's actual owner, not just the caller's
+  say-so - `changeTier`/`cancel` check ownership immediately after loading the subscription,
+  before the state-machine check, so a non-owner can't infer a stranger's subscription lifecycle
+  state as a side effect of a rejected request. This is explicitly NOT authentication - the
+  header is self-asserted, not checked against a password/token/session - so it stops accidental
+  or casual cross-user calls, not a determined attacker who sets an arbitrary header. The two
+  catalog endpoints, `GET /plans` and `GET /tiers`, deliberately stay open: they take no user id
+  at all, so there is no owner to check a caller against, and requiring a header there would be
+  friction with zero access-control benefit. See `CallerIdentityGuard`'s Javadoc for the full
+  reasoning and what a production identity layer would replace. Covered by
+  `MembershipApiIntegrationTest.crossUserSubscriptionMutationIsRejectedWith403`,
+  `.crossUserReadIsRejectedWith403`, and `.missingCallerHeaderIsRejectedWith403`.
 - **Schema is owned by Flyway, not Hibernate auto-DDL.** `V1__init_schema.sql` replaces
   `ddl-auto: update` for both H2 and Postgres, so multiple application-server instances no
   longer race each other on schema creation against a shared database - exactly the class of bug
@@ -204,9 +221,15 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   hitting different application servers but sharing the same database are serialized for that
   user. The `ActiveMembershipLock` unique constraint remains a second database invariant.
   Redis/ZooKeeper-style distributed locks are still unnecessary for this exercise.
-- **Event-sourced subscription history** - `Subscription` remains a mutable current-state row,
-  not an append-only event log. Full event sourcing and a detailed tier-change audit trail are
-  production extensions, not required for the exercise.
+- **Full event sourcing** - `Subscription` remains a mutable current-state row, not an
+  append-only log that its current state is derived from; a full rewrite of the persistence
+  model and every read path is a materially different, riskier change than this exercise calls
+  for. What IS implemented, narrower and additive rather than a replacement: `TierChangeAudit`
+  (see Design summary above) records every tier change as it happens, so "why is this user on
+  Gold, and when did that happen" is answerable without touching how `Subscription` itself is
+  stored. A full event-sourced rewrite and a richer per-change audit (capturing which criterion
+  and threshold actually triggered a promotion, not just the before/after tier) remain
+  production extensions.
 - **Full order/catalog subsystem** - `OrderRecord` remains a minimal stand-in (value + timestamp)
   purely as the input signal for tier evaluation, since a real order/catalog system is out of
   scope for this exercise.
@@ -215,15 +238,17 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and exposes
   entitlements; it does not reach into a sales system or support-routing system to enforce them.
   Those downstream systems should consume the entitlement through their own service boundaries.
-- **A real identity/session layer, and authorization on read endpoints** - `CallerIdentityGuard`
-  (see Design summary) closes the most direct hole in mutating user-scoped endpoints, but it is
-  explicitly not authentication: `X-User-Id` is self-asserted, not checked against a
-  password/token/session, so a caller who sets an arbitrary header is not stopped. Read
-  endpoints (`GET /membership`, `GET /plans`, `GET /tiers`, checkout benefit calculation,
-  exclusive deals) are not covered at all - anyone can still read any user's membership status
-  or run a hypothetical checkout for them. A production deployment replaces the header check
-  with the platform's real identity/session layer and extends coverage to reads where the
-  business decides that's warranted.
+- **A real identity/session layer** - `CallerIdentityGuard` (see Design summary) now covers
+  every endpoint that returns or acts on a specific user's data - subscribe, change tier,
+  cancel, place/cancel an order, reconcile tier, `GET /membership`, `GET /tier-history`, `GET
+  /exclusive-deals`, and `POST /checkout/benefits` - but it is explicitly not authentication:
+  `X-User-Id` is self-asserted, not checked against a password/token/session, so a caller who
+  sets an arbitrary header is not stopped, only a caller who doesn't bother to. The two catalog
+  endpoints, `GET /plans` and `GET /tiers`, deliberately remain open - they take no user id at
+  all, so there is no owner to check a caller against; requiring a header there would mean "any
+  value at all passes," which is friction with zero access-control benefit, not protection. A
+  production deployment replaces the header check with the platform's real identity/session
+  layer; every call site only needs that one method's return value to change.
 - **Full production observability** - promotions, demotions, conflicts, and reconciliation events
   are logged through SLF4J, but the service does not add a metrics/trace/audit platform.
 
@@ -245,7 +270,7 @@ disposition of each - what got fixed, what got documented instead of built, and 
 | 9 | Explicitly define demotion policy | **Documented.** Promotion + automatic demotion, both driven by evaluation triggers - see ambiguity #7 and `TierReevaluationTransaction` Javadoc. |
 | 10 | Benefit definition vs. enforcement | **Documented** - see "deliberately not implemented" above; this service defines/exposes entitlements, doesn't enforce them downstream. |
 | 11 | Separate `Subscription` from a `TierQualification` entity | **Not done.** Would help audit/debug at real scale; adds a second entity and a sync concern for a take-home. |
-| 12 | Store tier-change reason (previous/new/criterion/actual/threshold) | **Not done** - same reasoning as #11; noted as a good production addition. |
+| 12 | Store tier-change reason (previous/new/criterion/actual/threshold) | **Partially implemented.** `TierChangeAudit` now records previous tier, new tier, source (`USER_SELECTED`/`SYSTEM_PROMOTED`), and timestamp for every change, exposed at `GET /users/{userId}/tier-history`. It does not (yet) capture which specific criterion/actual value/threshold triggered a promotion - that finer detail remains a good production addition. |
 | 13 | Composable AND/OR tier criteria | **Already implemented** before this review - `Tier.criteriaMatchMode` (`ANY`/`OR`). |
 | 14 | Explicit tier rank instead of enum ordering | **Already implemented** before this review - `Tier.rank`, used by `TierEvaluator` via `Comparator.comparingInt(Tier::getRank)`. |
 | 15 | Richer benefit definition (priority, stackable flag, JSON config blob) | **Not done** - the current `type + paramValue + scope` shape covers everything the spec asks for; a generic config blob would trade compile-time safety for flexibility this exercise doesn't need yet. |
@@ -332,28 +357,28 @@ SUB_ID=$(curl -s -X POST localhost:8080/api/subscriptions \
   -d '{"userId": 1, "planId": 1, "tierId": 1}' | tee /dev/stderr | jq -r .subscriptionId)
 
 # 3. Track current membership
-curl -s localhost:8080/api/users/1/membership | jq
+curl -s localhost:8080/api/users/1/membership -H "X-User-Id: 1" | jq
 
 # 4. Place 11 orders of value 100 each - crosses Gold's ">10 orders" criterion
 for i in $(seq 1 11); do
   curl -s -X POST localhost:8080/api/users/1/orders \
     -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"value": 100}' > /dev/null
 done
-curl -s localhost:8080/api/users/1/membership | jq   # tierName should now be GOLD, tierSource SYSTEM_PROMOTED
+curl -s localhost:8080/api/users/1/membership -H "X-User-Id: 1" | jq   # tierName should now be GOLD, tierSource SYSTEM_PROMOTED
 
 # 5. User manually downgrades back to Silver - system must NOT immediately re-promote
 curl -s -X PATCH localhost:8080/api/subscriptions/$SUB_ID/tier \
   -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"newTierId": 1}' | jq
-curl -s localhost:8080/api/users/1/membership | jq   # tierName SILVER, tierSource USER_SELECTED
+curl -s localhost:8080/api/users/1/membership -H "X-User-Id: 1" | jq   # tierName SILVER, tierSource USER_SELECTED
 
 # 6. One more order re-enters automatic evaluation - should promote back to GOLD
 curl -s -X POST localhost:8080/api/users/1/orders \
   -H "Content-Type: application/json" -H "X-User-Id: 1" -d '{"value": 100}' | jq
-curl -s localhost:8080/api/users/1/membership | jq   # back to GOLD, SYSTEM_PROMOTED
+curl -s localhost:8080/api/users/1/membership -H "X-User-Id: 1" | jq   # back to GOLD, SYSTEM_PROMOTED
 
 # 7. Checkout benefits for a cart - user 1 is on GOLD at this point (free delivery + 5% off ALL)
 curl -s -X POST localhost:8080/api/users/1/checkout/benefits \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 1" \
   -d '{"items": [{"category": "Electronics", "price": 2000}, {"category": "Groceries", "price": 500}]}' | jq
 # expect totalDiscount = 125.00 (5% of the 2500 cart total), freeDelivery = true
 
@@ -368,13 +393,13 @@ curl -s -X POST localhost:8080/api/subscriptions \
 # 9. Cohort-based promotion - user 2 (VIP) qualifies for Platinum with zero orders
 curl -s -X POST localhost:8080/api/subscriptions \
   -H "Content-Type: application/json" -H "X-User-Id: 2" -d '{"userId": 2, "planId": 1, "tierId": 3}' | jq
-curl -s localhost:8080/api/users/2/membership | jq
+curl -s localhost:8080/api/users/2/membership -H "X-User-Id: 2" | jq
 
 # 10. Discount stacking policy - user 2 is on PLATINUM,
 #     which has BOTH "10% off ALL" and "15% off Electronics". The two must NOT stack:
 #     Electronics gets 15%, Groceries falls back to the 10% ALL rate.
 curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 2" \
   -d '{"items": [{"category": "Electronics", "price": 1000}, {"category": "Groceries", "price": 500}]}' | jq
 # expect totalDiscount = 200.00 (150 Electronics @15% + 50 Groceries @10%), NOT 300.00
 
@@ -382,12 +407,18 @@ curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
 curl -s -X POST localhost:8080/api/users/2/reconcile-tier -H "X-User-Id: 2" | jq
 
 # 11b. Platinum exclusive deal + entitlement. Beauty gets its exclusive 20%, not the global 10%;
-#      EARLY_ACCESS reports configuredValue 7 and scope DAYS.
-curl -s localhost:8080/api/users/2/exclusive-deals | jq
+#      EARLY_ACCESS reports configuredValue 7 and scope DAYS. appliedBenefits will also include
+#      an EXPEDITED_DELIVERY entry (configuredValue 1) - Platinum's graduated delivery-speed
+#      perk, distinct from the FREE_DELIVERY flag every paid tier gets.
+curl -s localhost:8080/api/users/2/exclusive-deals -H "X-User-Id: 2" | jq
 curl -s -X POST localhost:8080/api/users/2/checkout/benefits \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json" -H "X-User-Id: 2" \
   -d '{"items": [{"category": "Beauty", "price": 1000}]}' | jq
 # expect totalDiscount = 200.00
+
+# 11c. Tier-change history for user 1 - every entry from the promotions/downgrade/re-promotion
+#      sequence in steps 4-6 above, oldest first, with the previous/new tier and who/what caused it.
+curl -s localhost:8080/api/users/1/tier-history -H "X-User-Id: 1" | jq
 
 # 12. Concurrent duplicate-subscribe protection - fire two subscribe requests for the SAME
 #     new user at once; exactly one should return 201, the other 409.

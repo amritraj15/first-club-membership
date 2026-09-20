@@ -25,6 +25,15 @@ import org.springframework.stereotype.Component;
  * paid membership, force order-driven tier changes on someone else's account), not to every
  * place a user id appears in a URL. Broadening that scope is a reasonable follow-up, not done
  * here to keep this change reviewable as one clear boundary rather than a rewrite of every route.
+ * <p>
+ * As of this change, every endpoint that returns or acts on a SPECIFIC user's data requires
+ * this header - {@code GET /membership}, {@code GET /tier-history}, {@code GET
+ * /exclusive-deals}, and {@code POST /checkout/benefits}, in addition to every mutation. The
+ * two genuinely public catalog endpoints, {@code GET /plans} and {@code GET /tiers}, deliberately
+ * remain open: they take no user id at all, so there is no owner to check a caller against -
+ * requiring a header there would mean "any value at all passes," which is friction with zero
+ * access-control benefit, not protection. Applying the guard where it can't mean anything would
+ * be worse than not applying it, since it would misleadingly suggest those routes are protected.
  */
 @Component
 public class CallerIdentityGuard {

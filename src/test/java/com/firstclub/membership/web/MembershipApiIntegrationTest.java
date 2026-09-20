@@ -15,6 +15,7 @@ import com.firstclub.membership.dto.PlanDtos.TierResponse;
 import com.firstclub.membership.dto.SubscriptionDtos.ChangeTierRequest;
 import com.firstclub.membership.dto.SubscriptionDtos.MembershipStatusResponse;
 import com.firstclub.membership.dto.SubscriptionDtos.SubscribeRequest;
+import com.firstclub.membership.dto.SubscriptionDtos.TierChangeHistoryEntry;
 import com.firstclub.membership.dto.UserDtos.CreateUserRequest;
 import com.firstclub.membership.dto.UserDtos.UserResponse;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +24,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.HttpEntity;
@@ -52,10 +54,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * fixed seeded IDs, since DataSeeder's auto-increment IDs are an implementation detail, not a
  * contract.
  * <p>
- * Every mutating call below now goes through {@link #asUser} / {@link #userHeaders}, supplying
- * the {@code X-User-Id} header {@link com.firstclub.membership.service.CallerIdentityGuard}
- * requires - see {@link #crossUserSubscriptionMutationIsRejectedWith403()} and
- * {@link #missingCallerHeaderIsRejectedWith403()} for tests of the guard itself.
+ * Every call that touches a specific user's data - mutating OR reading - now goes through
+ * {@link #asUser} / {@link #getAsUser} / {@link #userHeaders}, supplying the {@code X-User-Id}
+ * header {@link com.firstclub.membership.service.CallerIdentityGuard} requires. The two catalog
+ * reads ({@code GET /plans}, {@code GET /tiers}) take no user id and stay unauthenticated - see
+ * that class's javadoc for why. See {@link #crossUserSubscriptionMutationIsRejectedWith403()},
+ * {@link #crossUserReadIsRejectedWith403()}, and {@link #missingCallerHeaderIsRejectedWith403()}
+ * for tests of the guard itself.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = "membership.admin.api-key=integration-test-admin-key")
@@ -110,7 +115,7 @@ class MembershipApiIntegrationTest {
         return headers;
     }
 
-    /** The caller-identity header every mutating endpoint now requires - see
+    /** The caller-identity header every user-scoped endpoint now requires - see
      *  {@link com.firstclub.membership.service.CallerIdentityGuard}. */
     private HttpHeaders userHeaders(Long userId) {
         HttpHeaders headers = new HttpHeaders();
@@ -123,10 +128,17 @@ class MembershipApiIntegrationTest {
         return new HttpEntity<>(body, userHeaders(userId));
     }
 
-    /** For mutating calls that carry no body (DELETE, the reconcile-tier POST) but still need
-     *  the caller-identity header. */
+    /** For calls that carry no body (DELETE, the reconcile-tier POST, every GET below) but
+     *  still need the caller-identity header. */
     private HttpEntity<Void> asUser(Long userId) {
         return new HttpEntity<>(userHeaders(userId));
+    }
+
+    /** GETs a user-scoped endpoint with the caller-identity header - TestRestTemplate's
+     *  getForEntity has no overload that accepts headers, so every now-guarded read goes
+     *  through exchange() instead. */
+    private <T> ResponseEntity<T> getAsUser(String path, Long userId, Class<T> responseType) {
+        return rest.exchange(url(path), HttpMethod.GET, asUser(userId), responseType);
     }
 
     // ---- Happy path: subscribe, track, cancel ----
@@ -143,15 +155,15 @@ class MembershipApiIntegrationTest {
         assertEquals("SILVER", subscribeResponse.getBody().tierName());
         Long subscriptionId = subscribeResponse.getBody().subscriptionId();
 
-        ResponseEntity<MembershipStatusResponse> membership = rest.getForEntity(
-                url("/api/users/" + userId + "/membership"), MembershipStatusResponse.class);
+        ResponseEntity<MembershipStatusResponse> membership =
+                getAsUser("/api/users/" + userId + "/membership", userId, MembershipStatusResponse.class);
         assertEquals(HttpStatus.OK, membership.getStatusCode());
         assertEquals(subscriptionId, membership.getBody().subscriptionId());
 
-        rest.exchange(url("/api/subscriptions/" + subscriptionId), org.springframework.http.HttpMethod.DELETE,
+        rest.exchange(url("/api/subscriptions/" + subscriptionId), HttpMethod.DELETE,
                 asUser(userId), Void.class);
-        ResponseEntity<MembershipStatusResponse> afterCancel = rest.getForEntity(
-                url("/api/users/" + userId + "/membership"), MembershipStatusResponse.class);
+        ResponseEntity<MembershipStatusResponse> afterCancel =
+                getAsUser("/api/users/" + userId + "/membership", userId, MembershipStatusResponse.class);
         assertEquals("CANCELLED", afterCancel.getBody().status());
     }
 
@@ -178,7 +190,7 @@ class MembershipApiIntegrationTest {
         ResponseEntity<MembershipStatusResponse> first = rest.postForEntity(url("/api/subscriptions"),
                 asUser(new SubscribeRequest(userId, monthlyPlanId, silverTierId), userId), MembershipStatusResponse.class);
         rest.exchange(url("/api/subscriptions/" + first.getBody().subscriptionId()),
-                org.springframework.http.HttpMethod.DELETE, asUser(userId), Void.class);
+                HttpMethod.DELETE, asUser(userId), Void.class);
 
         ResponseEntity<MembershipStatusResponse> second = rest.postForEntity(url("/api/subscriptions"),
                 asUser(new SubscribeRequest(userId, monthlyPlanId, goldTierId), userId), MembershipStatusResponse.class);
@@ -247,14 +259,14 @@ class MembershipApiIntegrationTest {
         }
         assertEquals("GOLD", lastOrder.currentTier());
 
-        MembershipStatusResponse afterPromotion = rest.getForEntity(
-                url("/api/users/" + userId + "/membership"), MembershipStatusResponse.class).getBody();
+        MembershipStatusResponse afterPromotion =
+                getAsUser("/api/users/" + userId + "/membership", userId, MembershipStatusResponse.class).getBody();
         assertEquals("GOLD", afterPromotion.tierName());
         assertEquals("SYSTEM_PROMOTED", afterPromotion.tierSource());
 
         // Manual downgrade back to Silver - must stick immediately.
         ResponseEntity<MembershipStatusResponse> downgraded = rest.exchange(
-                url("/api/subscriptions/" + subscriptionId + "/tier"), org.springframework.http.HttpMethod.PATCH,
+                url("/api/subscriptions/" + subscriptionId + "/tier"), HttpMethod.PATCH,
                 asUser(new ChangeTierRequest(silverTierId), userId),
                 MembershipStatusResponse.class);
         assertEquals("SILVER", downgraded.getBody().tierName());
@@ -265,6 +277,31 @@ class MembershipApiIntegrationTest {
                 url("/api/users/" + userId + "/orders"), asUser(new PlaceOrderRequest(new BigDecimal("50")), userId),
                 OrderPlacedResponse.class);
         assertEquals("GOLD", anotherOrder.getBody().currentTier());
+
+        // Fix #5: the audit trail (TierChangeAudit) should have recorded all four transitions,
+        // in order, with the right previous/new tier and source on each - not just the current
+        // state, which is all `/membership` can show.
+        ResponseEntity<TierChangeHistoryEntry[]> history =
+                getAsUser("/api/users/" + userId + "/tier-history", userId, TierChangeHistoryEntry[].class);
+        assertEquals(HttpStatus.OK, history.getStatusCode());
+        List<TierChangeHistoryEntry> entries = List.of(history.getBody());
+        assertEquals(4, entries.size(), "initial assignment, auto-promotion, manual override, re-promotion");
+
+        assertEquals(null, entries.get(0).previousTierName(), "no previous tier for the initial assignment");
+        assertEquals("SILVER", entries.get(0).newTierName());
+        assertEquals("USER_SELECTED", entries.get(0).tierSource());
+
+        assertEquals("SILVER", entries.get(1).previousTierName());
+        assertEquals("GOLD", entries.get(1).newTierName());
+        assertEquals("SYSTEM_PROMOTED", entries.get(1).tierSource());
+
+        assertEquals("GOLD", entries.get(2).previousTierName());
+        assertEquals("SILVER", entries.get(2).newTierName());
+        assertEquals("USER_SELECTED", entries.get(2).tierSource());
+
+        assertEquals("SILVER", entries.get(3).previousTierName());
+        assertEquals("GOLD", entries.get(3).newTierName());
+        assertEquals("SYSTEM_PROMOTED", entries.get(3).tierSource());
     }
 
     // ---- Fix #3: discount policy - category-specific must NOT stack with ALL ----
@@ -281,7 +318,7 @@ class MembershipApiIntegrationTest {
                 new CartItem("Groceries", new BigDecimal("500"))
         ));
         ResponseEntity<CheckoutResponse> response = rest.postForEntity(
-                url("/api/users/" + userId + "/checkout/benefits"), request, CheckoutResponse.class);
+                url("/api/users/" + userId + "/checkout/benefits"), asUser(request, userId), CheckoutResponse.class);
 
         CheckoutResponse body = response.getBody();
         // Electronics: 15% of 1000 = 150 (NOT 25% / 250 - that would mean the two rates stacked).
@@ -300,15 +337,16 @@ class MembershipApiIntegrationTest {
         rest.postForEntity(url("/api/subscriptions"),
                 asUser(new SubscribeRequest(userId, monthlyPlanId, platinumTierId), userId), MembershipStatusResponse.class);
 
-        ResponseEntity<ExclusiveDealResponse[]> deals = rest.getForEntity(
-                url("/api/users/" + userId + "/exclusive-deals"), ExclusiveDealResponse[].class);
+        ResponseEntity<ExclusiveDealResponse[]> deals =
+                getAsUser("/api/users/" + userId + "/exclusive-deals", userId, ExclusiveDealResponse[].class);
         assertEquals(HttpStatus.OK, deals.getStatusCode());
         assertTrue(List.of(deals.getBody()).stream().anyMatch(deal -> deal.category().equals("Beauty")
                 && deal.discountPercent().compareTo(new BigDecimal("20")) == 0));
 
         ResponseEntity<CheckoutResponse> response = rest.postForEntity(
                 url("/api/users/" + userId + "/checkout/benefits"),
-                new CheckoutRequest(List.of(new CartItem("Beauty", new BigDecimal("1000")))), CheckoutResponse.class);
+                asUser(new CheckoutRequest(List.of(new CartItem("Beauty", new BigDecimal("1000")))), userId),
+                CheckoutResponse.class);
 
         CheckoutResponse body = response.getBody();
         assertEquals(0, body.totalDiscount().compareTo(new BigDecimal("200.00")));
@@ -329,7 +367,7 @@ class MembershipApiIntegrationTest {
         UpsertTierBenefitRequest create = new UpsertTierBenefitRequest(
                 com.firstclub.membership.domain.BenefitType.EXCLUSIVE_DEAL, new BigDecimal("25"), "Books");
         ResponseEntity<TierBenefitAdminResponse> created = rest.exchange(
-                url("/api/admin/tiers/" + platinumTierId + "/benefits"), org.springframework.http.HttpMethod.POST,
+                url("/api/admin/tiers/" + platinumTierId + "/benefits"), HttpMethod.POST,
                 new HttpEntity<>(create, adminHeaders()), TierBenefitAdminResponse.class);
         assertEquals(HttpStatus.CREATED, created.getStatusCode());
         assertTrue(created.getBody().id() != null);
@@ -337,7 +375,7 @@ class MembershipApiIntegrationTest {
         UpsertTierBenefitRequest update = new UpsertTierBenefitRequest(
                 com.firstclub.membership.domain.BenefitType.EXCLUSIVE_DEAL, new BigDecimal("30"), "Books");
         ResponseEntity<TierBenefitAdminResponse> changed = rest.exchange(
-                url("/api/admin/benefits/" + created.getBody().id()), org.springframework.http.HttpMethod.PATCH,
+                url("/api/admin/benefits/" + created.getBody().id()), HttpMethod.PATCH,
                 new HttpEntity<>(update, adminHeaders()), TierBenefitAdminResponse.class);
         assertEquals(HttpStatus.OK, changed.getStatusCode());
         assertEquals(0, changed.getBody().paramValue().compareTo(new BigDecimal("30")));
@@ -347,7 +385,8 @@ class MembershipApiIntegrationTest {
                 asUser(new SubscribeRequest(userId, monthlyPlanId, platinumTierId), userId), MembershipStatusResponse.class);
         ResponseEntity<CheckoutResponse> checkout = rest.postForEntity(
                 url("/api/users/" + userId + "/checkout/benefits"),
-                new CheckoutRequest(List.of(new CartItem("Books", new BigDecimal("1000")))), CheckoutResponse.class);
+                asUser(new CheckoutRequest(List.of(new CartItem("Books", new BigDecimal("1000")))), userId),
+                CheckoutResponse.class);
         assertEquals(0, checkout.getBody().totalDiscount().compareTo(new BigDecimal("300.00")));
     }
 
@@ -373,11 +412,11 @@ class MembershipApiIntegrationTest {
                 asUser(new SubscribeRequest(userId, monthlyPlanId, silverTierId), userId), MembershipStatusResponse.class);
         Long subscriptionId = sub.getBody().subscriptionId();
 
-        rest.exchange(url("/api/subscriptions/" + subscriptionId), org.springframework.http.HttpMethod.DELETE,
+        rest.exchange(url("/api/subscriptions/" + subscriptionId), HttpMethod.DELETE,
                 asUser(userId), Void.class);
 
         ResponseEntity<Map> secondCancel = rest.exchange(
-                url("/api/subscriptions/" + subscriptionId), org.springframework.http.HttpMethod.DELETE,
+                url("/api/subscriptions/" + subscriptionId), HttpMethod.DELETE,
                 asUser(userId), Map.class);
         assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, secondCancel.getStatusCode());
     }
@@ -386,7 +425,11 @@ class MembershipApiIntegrationTest {
 
     @Test
     void unknownUserMembershipReturns404() {
-        ResponseEntity<Map> response = rest.getForEntity(url("/api/users/999999/membership"), Map.class);
+        // Header must match the (nonexistent) path user id so CallerIdentityGuard's ownership
+        // check passes and the request actually reaches the "does this user exist" check this
+        // test is for - a mismatched or missing header would produce 403 instead, which is a
+        // real but different failure mode, covered separately by the guard-specific tests below.
+        ResponseEntity<Map> response = getAsUser("/api/users/999999/membership", 999999L, Map.class);
         assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
     }
 
@@ -399,7 +442,7 @@ class MembershipApiIntegrationTest {
                 asUser(new SubscribeRequest(userId, monthlyPlanId, silverTierId), userId), MembershipStatusResponse.class);
 
         ResponseEntity<Map> response = rest.exchange(
-                url("/api/users/" + userId + "/reconcile-tier"), org.springframework.http.HttpMethod.POST,
+                url("/api/users/" + userId + "/reconcile-tier"), HttpMethod.POST,
                 asUser(userId), Map.class);
         assertEquals(HttpStatus.OK, response.getStatusCode());
         assertEquals(false, response.getBody().get("tierChanged"));
@@ -458,7 +501,7 @@ class MembershipApiIntegrationTest {
 
         ResponseEntity<PlanPriceAdminResponse> updated = rest.exchange(
                 url("/api/admin/plans/" + monthlyPlanId + "/price"),
-                org.springframework.http.HttpMethod.PATCH,
+                HttpMethod.PATCH,
                 new HttpEntity<>(new UpdatePlanPriceRequest(new BigDecimal("249.00"), "INR"), adminHeaders()),
                 PlanPriceAdminResponse.class);
 
@@ -466,8 +509,8 @@ class MembershipApiIntegrationTest {
         assertTrue(updated.getBody().version() > oldVersion);
         assertEquals(0, new BigDecimal("249.00").compareTo(updated.getBody().price()));
 
-        ResponseEntity<Map> oldMembership = rest.getForEntity(
-                url("/api/users/" + userId + "/membership"), Map.class);
+        ResponseEntity<Map> oldMembership =
+                getAsUser("/api/users/" + userId + "/membership", userId, Map.class);
         assertEquals(oldVersion, ((Number) oldMembership.getBody().get("planPriceVersion")).intValue());
         assertEquals(0, oldPrice.compareTo(new BigDecimal(oldMembership.getBody().get("price").toString())));
 
@@ -524,12 +567,12 @@ class MembershipApiIntegrationTest {
         // Attacker asserts their OWN identity but targets the owner's subscription id - must be
         // rejected before any lifecycle/state-machine check runs, not silently succeed.
         ResponseEntity<Map> forgedCancel = rest.exchange(
-                url("/api/subscriptions/" + subscriptionId), org.springframework.http.HttpMethod.DELETE,
+                url("/api/subscriptions/" + subscriptionId), HttpMethod.DELETE,
                 asUser(attacker), Map.class);
         assertEquals(HttpStatus.FORBIDDEN, forgedCancel.getStatusCode());
 
         ResponseEntity<Map> forgedTierChange = rest.exchange(
-                url("/api/subscriptions/" + subscriptionId + "/tier"), org.springframework.http.HttpMethod.PATCH,
+                url("/api/subscriptions/" + subscriptionId + "/tier"), HttpMethod.PATCH,
                 asUser(new ChangeTierRequest(goldTierId), attacker), Map.class);
         assertEquals(HttpStatus.FORBIDDEN, forgedTierChange.getStatusCode());
 
@@ -539,10 +582,46 @@ class MembershipApiIntegrationTest {
         assertEquals(HttpStatus.FORBIDDEN, forgedOrder.getStatusCode());
 
         // The subscription must be untouched - still active, still owned by the real user.
-        MembershipStatusResponse stillActive = rest.getForEntity(
-                url("/api/users/" + owner + "/membership"), MembershipStatusResponse.class).getBody();
+        MembershipStatusResponse stillActive =
+                getAsUser("/api/users/" + owner + "/membership", owner, MembershipStatusResponse.class).getBody();
         assertEquals("ACTIVE", stillActive.status());
         assertEquals("SILVER", stillActive.tierName());
+    }
+
+    /** Companion to {@link #crossUserSubscriptionMutationIsRejectedWith403()}: the same guard,
+     *  now applied to reads (membership, tier-history, exclusive-deals, checkout benefits) as
+     *  well as mutations - an attacker asserting their own real identity must not be able to
+     *  read another user's membership, history, deals, or run a checkout calculation against
+     *  another user's tier. */
+    @Test
+    void crossUserReadIsRejectedWith403() {
+        Long owner = createUser("ReadOwner", "read-owner+" + System.nanoTime() + "@example.com", "VIP");
+        Long attacker = createUser("ReadAttacker", "read-attacker+" + System.nanoTime() + "@example.com", null);
+        rest.postForEntity(url("/api/subscriptions"),
+                asUser(new SubscribeRequest(owner, monthlyPlanId, platinumTierId), owner), MembershipStatusResponse.class);
+
+        ResponseEntity<Map> forgedMembership =
+                getAsUser("/api/users/" + owner + "/membership", attacker, Map.class);
+        assertEquals(HttpStatus.FORBIDDEN, forgedMembership.getStatusCode());
+
+        ResponseEntity<Map> forgedHistory =
+                getAsUser("/api/users/" + owner + "/tier-history", attacker, Map.class);
+        assertEquals(HttpStatus.FORBIDDEN, forgedHistory.getStatusCode());
+
+        ResponseEntity<Map> forgedDeals =
+                getAsUser("/api/users/" + owner + "/exclusive-deals", attacker, Map.class);
+        assertEquals(HttpStatus.FORBIDDEN, forgedDeals.getStatusCode());
+
+        ResponseEntity<Map> forgedCheckout = rest.postForEntity(
+                url("/api/users/" + owner + "/checkout/benefits"),
+                asUser(new CheckoutRequest(List.of(new CartItem("Beauty", new BigDecimal("1000")))), attacker),
+                Map.class);
+        assertEquals(HttpStatus.FORBIDDEN, forgedCheckout.getStatusCode());
+
+        // The two catalog endpoints take no user id at all - they stay open, on purpose (see
+        // CallerIdentityGuard's javadoc), so no header is required or checked here.
+        ResponseEntity<TierResponse[]> tiers = rest.getForEntity(url("/api/tiers"), TierResponse[].class);
+        assertEquals(HttpStatus.OK, tiers.getStatusCode());
     }
 
     @Test

@@ -62,6 +62,9 @@ public class BenefitService {
                     nonDiscountBenefits.add(new AppliedBenefit(BenefitType.FREE_DELIVERY.name(), benefit.getScope(),
                             BigDecimal.ZERO, benefit.getParamValue()));
                 }
+                case EXPEDITED_DELIVERY -> nonDiscountBenefits.add(
+                        new AppliedBenefit(BenefitType.EXPEDITED_DELIVERY.name(), benefit.getScope(),
+                                BigDecimal.ZERO, benefit.getParamValue()));
                 case PRIORITY_SUPPORT -> {
                     prioritySupport = true;
                     nonDiscountBenefits.add(new AppliedBenefit(BenefitType.PRIORITY_SUPPORT.name(), benefit.getScope(),

@@ -99,6 +99,7 @@ public class DataSeeder implements CommandLineRunner {
                 CriteriaWindowType.ROLLING_DAYS, 30));
         platinum.addCriterion(new TierCriterion(CriteriaType.COHORT, BigDecimal.ZERO, "VIP"));
         platinum.addBenefit(new TierBenefit(BenefitType.FREE_DELIVERY, BigDecimal.ZERO, "ALL"));
+        platinum.addBenefit(new TierBenefit(BenefitType.EXPEDITED_DELIVERY, new BigDecimal("1"), "DAYS"));
         platinum.addBenefit(new TierBenefit(BenefitType.PERCENTAGE_DISCOUNT, new BigDecimal("10"), "ALL"));
         platinum.addBenefit(new TierBenefit(BenefitType.PERCENTAGE_DISCOUNT, new BigDecimal("15"), "Electronics"));
         platinum.addBenefit(new TierBenefit(BenefitType.EXCLUSIVE_DEAL, new BigDecimal("20"), "Beauty"));

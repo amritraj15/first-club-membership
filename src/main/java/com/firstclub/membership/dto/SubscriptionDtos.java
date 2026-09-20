@@ -34,4 +34,16 @@ public class SubscriptionDtos {
             String currency
     ) {
     }
+
+    /** One row of {@code GET /users/{userId}/tier-history} - see {@link
+     *  com.firstclub.membership.domain.TierChangeAudit}. {@code previousTierName} is null only
+     *  for a subscription's very first entry (the initial tier chosen at subscribe time). */
+    public record TierChangeHistoryEntry(
+            Long subscriptionId,
+            String previousTierName,
+            String newTierName,
+            String tierSource,
+            String changedAt
+    ) {
+    }
 }

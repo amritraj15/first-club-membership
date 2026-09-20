@@ -75,6 +75,9 @@ public class AdminBenefitService {
         if (request.benefitType() == BenefitType.EARLY_ACCESS && value.compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("Early-access days must be greater than 0");
         }
+        if (request.benefitType() == BenefitType.EXPEDITED_DELIVERY && value.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Expedited-delivery days must be greater than 0");
+        }
     }
 
     private TierBenefitAdminResponse toResponse(TierBenefit benefit) {

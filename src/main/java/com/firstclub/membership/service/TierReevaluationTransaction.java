@@ -5,11 +5,13 @@ import com.firstclub.membership.domain.OrderRecord;
 import com.firstclub.membership.domain.Subscription;
 import com.firstclub.membership.domain.SubscriptionStatus;
 import com.firstclub.membership.domain.Tier;
+import com.firstclub.membership.domain.TierChangeAudit;
 import com.firstclub.membership.domain.TierCriterion;
 import com.firstclub.membership.domain.TierSource;
 import com.firstclub.membership.domain.User;
 import com.firstclub.membership.repository.OrderRecordRepository;
 import com.firstclub.membership.repository.SubscriptionRepository;
+import com.firstclub.membership.repository.TierChangeAuditRepository;
 import com.firstclub.membership.strategy.TierEvaluator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +60,7 @@ public class TierReevaluationTransaction {
     private final PlanService planService;
     private final TierEvaluator tierEvaluator;
     private final QualificationWindowResolver qualificationWindowResolver;
+    private final TierChangeAuditRepository tierChangeAuditRepository;
     private final Clock clock;
 
     public TierReevaluationTransaction(SubscriptionRepository subscriptionRepository,
@@ -65,12 +68,14 @@ public class TierReevaluationTransaction {
                                         PlanService planService,
                                         TierEvaluator tierEvaluator,
                                         QualificationWindowResolver qualificationWindowResolver,
+                                        TierChangeAuditRepository tierChangeAuditRepository,
                                         Clock clock) {
         this.subscriptionRepository = subscriptionRepository;
         this.orderRecordRepository = orderRecordRepository;
         this.planService = planService;
         this.tierEvaluator = tierEvaluator;
         this.qualificationWindowResolver = qualificationWindowResolver;
+        this.tierChangeAuditRepository = tierChangeAuditRepository;
         this.clock = clock;
     }
 
@@ -106,9 +111,13 @@ public class TierReevaluationTransaction {
 
         log.info("Promoting/adjusting user {} from tier {} to {} based on order activity",
                 userId, subscription.getTier().getName(), qualifyingTier.getName());
+        Long previousTierId = subscription.getTier().getId();
         subscription.setTier(qualifyingTier);
         subscription.setTierSource(TierSource.SYSTEM_PROMOTED);
-        subscriptionRepository.save(subscription);
+        subscription = subscriptionRepository.save(subscription);
+        tierChangeAuditRepository.save(new TierChangeAudit(
+                userId, subscription.getId(), previousTierId, qualifyingTier.getId(),
+                TierSource.SYSTEM_PROMOTED, evaluationTime));
         return true;
     }
 
