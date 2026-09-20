@@ -10,13 +10,14 @@ support for shared multi-server deployments, no external services required.
 Verified with JDK 17.0.20.1 and Maven 3.9.16. The complete `mvn clean install` lifecycle passes:
 
 ```text
-Tests run: 27, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 31, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
-This includes fast unit tests and Spring Boot integration tests that start an embedded Tomcat
-server, exercise the REST API over HTTP, and verify concurrent subscription creation, idempotency,
-and price-versioning behaviour.
+This includes fast unit tests, a `@DataJpaTest` repository-layer test, and Spring Boot
+integration tests that start an embedded Tomcat server, exercise the REST API over HTTP, and
+verify concurrent subscription creation, idempotency, price-versioning behaviour, cross-user
+authorization rejection, and reconciliation-sweep pagination correctness.
 
 The successful Maven lifecycle also compiles the application, packages the Spring Boot JAR, and
 installs the artifact into the local Maven repository.
@@ -44,12 +45,18 @@ Run the tests:
 mvn test
 ```
 
-This runs both kinds of test in the suite:
+This runs all three kinds of test in the suite:
 - **Unit tests** (`strategy/TierEvaluatorTest`, `service/SubscriptionStateMachineTest`,
   `service/QualificationWindowResolverTest`) - plain JUnit 5, no Spring context, fast.
+- **Repository-layer test** (`repository/SubscriptionRepositoryPaginationTest`) - `@DataJpaTest`
+  against the real H2 + Flyway schema (not a mock), proving
+  `TierReconciliationScheduler`'s paginated user-id sweep visits every active user exactly once
+  across multiple pages, with no duplicates, gaps, or infinite-loop risk on an empty result.
 - **Integration tests** (`web/MembershipApiIntegrationTest`) - `@SpringBootTest` with a real
   embedded server and `TestRestTemplate`, exercising the actual REST API end-to-end, including
-  concurrent subscription creation, same-key idempotency, and plan-price versioning.
+  concurrent subscription creation, same-key idempotency, plan-price versioning, and
+  `CallerIdentityGuard` rejecting both a missing caller header and a caller acting on another
+  user's subscription/order.
 
 ## Design summary
 
@@ -125,6 +132,29 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
   `Plan` price represents the latest catalog version; a subscription stores the exact version
   purchased. Admin price changes create a new version rather than mutating a historical version,
   so existing subscriptions are grandfathered at their purchased price.
+- **Every mutating user-scoped endpoint requires and verifies a caller identity**
+  (`CallerIdentityGuard`). Subscribe, change tier, cancel, place/cancel an order, and reconcile
+  tier all require an `X-User-Id` header, checked against the resource's actual owner before any
+  mutation runs - `changeTier`/`cancel` check ownership immediately after loading the
+  subscription, before the state-machine check, so a non-owner can't infer a stranger's
+  subscription lifecycle state as a side effect of a rejected request. This is explicitly NOT
+  authentication - the header is self-asserted, not checked against a password/token/session -
+  so it stops accidental or casual cross-user calls, not a determined attacker who sets an
+  arbitrary header; see `CallerIdentityGuard`'s Javadoc for the exact scope boundary (read
+  endpoints are deliberately not covered) and what a production identity layer would replace.
+  Covered by `MembershipApiIntegrationTest.crossUserSubscriptionMutationIsRejectedWith403` and
+  `.missingCallerHeaderIsRejectedWith403`.
+- **Schema is owned by Flyway, not Hibernate auto-DDL.** `V1__init_schema.sql` replaces
+  `ddl-auto: update` for both H2 and Postgres, so multiple application-server instances no
+  longer race each other on schema creation against a shared database - exactly the class of bug
+  the rest of this design is careful about elsewhere (pessimistic locks, DB uniqueness
+  constraints, idempotency). `ddl-auto` is `none` rather than the stricter `validate`: validate
+  would be the more correct pairing (Hibernate checking its expected schema against what Flyway
+  created), but confirming an exact column-by-column match against a live schema export wasn't
+  possible in the environment this migration was authored in. Every functional constraint the
+  app actually depends on - PKs, FKs, uniqueness on `ActiveMembershipLock.userId` and the
+  idempotency-key pair - is still enforced at the DB level and exercised by
+  `MembershipApiIntegrationTest`, which touches nearly every column and constraint here.
 
 ## Ambiguities resolved (and how)
 
@@ -177,10 +207,6 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Event-sourced subscription history** - `Subscription` remains a mutable current-state row,
   not an append-only event log. Full event sourcing and a detailed tier-change audit trail are
   production extensions, not required for the exercise.
-- **Price versioning is NOT omitted anymore** - plan prices are now immutable `PlanVersion`
-  records. A subscription stores the exact purchased price version, so existing subscriptions
-  are grandfathered when an admin changes the current plan price. `PATCH /api/admin/plans/{id}/price`
-  creates a new version; it never mutates an existing version.
 - **Full order/catalog subsystem** - `OrderRecord` remains a minimal stand-in (value + timestamp)
   purely as the input signal for tier evaluation, since a real order/catalog system is out of
   scope for this exercise.
@@ -189,30 +215,17 @@ See the Javadoc on each class for the reasoning inline; this section is the shor
 - **Downstream enforcement of EARLY_ACCESS / PRIORITY_SUPPORT** - this service defines and exposes
   entitlements; it does not reach into a sales system or support-routing system to enforce them.
   Those downstream systems should consume the entitlement through their own service boundaries.
-- **Full authorization boundaries / admin-vs-user API separation** - every mutating user-scoped
-  endpoint (subscribe, change tier, cancel, place/cancel an order, reconcile tier) now requires
-  an `X-User-Id` header, verified against the resource's actual owner by `CallerIdentityGuard`
-  before any mutation runs. This is explicitly NOT authentication - the header is self-asserted,
-  not checked against a password/token/session - so it stops accidental or casual cross-user
-  calls, not a determined attacker who can set an arbitrary header. Read-only endpoints (`GET
-  /membership`, `GET /plans`, `GET /tiers`, checkout benefit calculation, exclusive deals) are
-  NOT covered - the guard is scoped to state-mutating actions, where an unauthenticated caller
-  could do real harm, not to every place a user id appears in a URL. Admin mutation routes keep
-  their separate `X-Admin-Api-Key` guard. Production should replace `CallerIdentityGuard`'s
-  header check with the platform's real identity/session layer; every call site only needs that
-  one method's return value to change.
+- **A real identity/session layer, and authorization on read endpoints** - `CallerIdentityGuard`
+  (see Design summary) closes the most direct hole in mutating user-scoped endpoints, but it is
+  explicitly not authentication: `X-User-Id` is self-asserted, not checked against a
+  password/token/session, so a caller who sets an arbitrary header is not stopped. Read
+  endpoints (`GET /membership`, `GET /plans`, `GET /tiers`, checkout benefit calculation,
+  exclusive deals) are not covered at all - anyone can still read any user's membership status
+  or run a hypothetical checkout for them. A production deployment replaces the header check
+  with the platform's real identity/session layer and extends coverage to reads where the
+  business decides that's warranted.
 - **Full production observability** - promotions, demotions, conflicts, and reconciliation events
   are logged through SLF4J, but the service does not add a metrics/trace/audit platform.
-- **Schema migration tooling: now Flyway, not further scoped down** - `V1__init_schema.sql`
-  replaces Hibernate's `ddl-auto: update` for both H2 and Postgres. `ddl-auto` is `none` rather
-  than the stricter `validate`: validate would be the more correct pairing (Hibernate checking
-  its expected schema against what Flyway created), but confirming an exact column-by-column
-  match against a live schema export wasn't possible in the environment this migration was
-  written in. Every functional constraint the app actually depends on - PKs, FKs, uniqueness on
-  `ActiveMembershipLock.userId` and the idempotency-key pair - is still enforced at the DB level;
-  run the full test suite after pulling this change, since `MembershipApiIntegrationTest`
-  exercises nearly every column and constraint here and will surface a real mismatch as a test
-  failure rather than a silent drift.
 
 ## Suggestions reviewed (from the implementation-review pass)
 
@@ -438,5 +451,10 @@ curl -s -X POST localhost:8080/api/admin/tiers/3/benefits \
   `TierReevaluationTransaction` and `TierReconciliationScheduler`. It performs at most one
   repository query per distinct requested window in an evaluation; if window/cardinality grows
   materially, aggregate queries or precomputed qualification snapshots are the next step.
+- The reconciliation sweep itself walks active users in bounded pages
+  (`membership.reconciliation.batch-size`, default 200) rather than loading the entire active
+  user base into memory in one query - see `SubscriptionRepository.findDistinctUserIdsByStatus`
+  and `SubscriptionRepositoryPaginationTest`, which proves the sweep visits every active user
+  exactly once across a multi-page walk with no duplicates or gaps.
 - For multi-server deployment, PostgreSQL is the shared consistency boundary for user-row locks,
   active-membership uniqueness, idempotency, and plan-version creation.
